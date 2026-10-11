@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test (macOS arm64)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Refuse committed APKs
+        run: |
+          found="$(git ls-files | grep -iE '\.(apk|xapk|apks|apkm)$' || true)"
+          if [ -n "$found" ]; then
+            echo "::error::APK files must never be committed:"
+            echo "$found"
+            exit 1
+          fi
+
+      - name: Toolchain
+        run: |
+          uname -m
+          sw_vers
+          swiftc --version
+          python --version
+
+      - name: Build launcher
+        run: /bin/sh launcher/build.sh
+
+      - name: Build icon compositor
+        run: /bin/bash iconkit/build.sh
+
+      - name: Unit tests
+        run: make test PYTHON=python

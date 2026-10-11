@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="droidrt-logo-title">
+  <title id="droidrt-logo-title">droidrt logo</title>
+  <defs>
+    <linearGradient id="lg-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#232A36"/>
+      <stop offset="1" stop-color="#0F131A"/>
+    </linearGradient>
+    <linearGradient id="lg-win" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E9EDF2"/>
+    </linearGradient>
+    <linearGradient id="lg-head" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5BE89B"/>
+      <stop offset="1" stop-color="#2CC572"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#lg-bg)"/>
+  <rect x="4.75" y="4.75" width="118.5" height="118.5" rx="27.25" fill="none" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="1.5"/>
+  <rect x="18" y="22" width="92" height="84" rx="13" fill="url(#lg-win)"/>
+  <path d="M18 42 V35 a13 13 0 0 1 13 -13 H97 a13 13 0 0 1 13 13 V42 Z" fill="#D9DFE6"/>
+  <circle cx="31" cy="32" r="4" fill="#FF5F57"/>
+  <circle cx="43" cy="32" r="4" fill="#FEBC2E"/>
+  <circle cx="55" cy="32" r="4" fill="#28C840"/>
+  <line x1="64" y1="61" x2="64" y2="53" stroke="#2CC572" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="64" cy="51" r="4.5" fill="#3DDC84"/>
+  <rect x="38" y="60" width="52" height="36" rx="12" fill="url(#lg-head)"/>
+  <rect x="45" y="69" width="38" height="17" rx="8.5" fill="#10151C"/>
+  <circle cx="56" cy="77.5" r="4" fill="#3DDC84"/>
+  <circle cx="72" cy="77.5" r="4" fill="#3DDC84"/>
+</svg>

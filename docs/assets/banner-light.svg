@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="400" viewBox="0 0 1280 400" role="img" aria-labelledby="t d">
+  <title id="t">droidrt: Android apps as native macOS apps</title>
+  <desc id="d">The droidrt logo and tagline next to a stylized macOS desktop with three Android apps, each in its own window.</desc>
+  <style>
+    .s { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif; }
+    .m { font-family: ui-monospace, 'SF Mono', Menlo, monospace; }
+    .tx { fill: #1F2328; }
+    .mu { fill: #59636E; }
+    .b { font-weight: 700; }
+    .sb { font-weight: 600; }
+  </style>
+  <defs>
+    <linearGradient id="lg-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#232A36"/><stop offset="1" stop-color="#0F131A"/>
+    </linearGradient>
+    <linearGradient id="lg-win" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#E9EDF2"/>
+    </linearGradient>
+    <linearGradient id="lg-head" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5BE89B"/><stop offset="1" stop-color="#2CC572"/>
+    </linearGradient>
+    <symbol id="logo" viewBox="0 0 128 128">
+      <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#lg-bg)"/>
+      <rect x="4.75" y="4.75" width="118.5" height="118.5" rx="27.25" fill="none" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="1.5"/>
+      <rect x="18" y="22" width="92" height="84" rx="13" fill="url(#lg-win)"/>
+      <path d="M18 42 V35 a13 13 0 0 1 13 -13 H97 a13 13 0 0 1 13 13 V42 Z" fill="#D9DFE6"/>
+      <circle cx="31" cy="32" r="4" fill="#FF5F57"/>
+      <circle cx="43" cy="32" r="4" fill="#FEBC2E"/>
+      <circle cx="55" cy="32" r="4" fill="#28C840"/>
+      <line x1="64" y1="61" x2="64" y2="53" stroke="#2CC572" stroke-width="4" stroke-linecap="round"/>
+      <circle cx="64" cy="51" r="4.5" fill="#3DDC84"/>
+      <rect x="38" y="60" width="52" height="36" rx="12" fill="url(#lg-head)"/>
+      <rect x="45" y="69" width="38" height="17" rx="8.5" fill="#10151C"/>
+      <circle cx="56" cy="77.5" r="4" fill="#3DDC84"/>
+      <circle cx="72" cy="77.5" r="4" fill="#3DDC84"/>
+    </symbol>
+    <filter id="sh" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#000000" flood-opacity="0.18"/>
+    </filter>
+    <filter id="sh2" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="3" stdDeviation="5" flood-color="#000000" flood-opacity="0.13"/>
+    </filter>
+    <marker id="ah-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#22B866"/>
+    </marker>
+    <marker id="ah-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#2F6FEB"/>
+    </marker>
+    <marker id="ah-p" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#7C5CDB"/>
+    </marker>
+    <marker id="ah-m" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#59636E"/>
+    </marker>
+    <linearGradient id="wall" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#CFE0FF"/><stop offset="1" stop-color="#CDF3DF"/>
+    </linearGradient>
+    <linearGradient id="art" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#A78BFA"/><stop offset="1" stop-color="#4C8DFF"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#3DDC84" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#3DDC84" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.4" fill="#1F2328" fill-opacity="0.10"/>
+    </pattern>
+    <linearGradient id="bgg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#F3F6F9"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="400" rx="24" fill="url(#bgg)"/>
+  <rect x="0.5" y="0.5" width="1279" height="399" rx="23.5" fill="none" stroke="#D1D9E0"/>
+  <rect x="620" y="0" width="660" height="400" fill="url(#dots)"/>
+  <ellipse cx="940" cy="210" rx="420" ry="230" fill="url(#glow)"/>
+  <use href="#logo" x="58" y="78" width="108" height="108"/>
+  <text x="186" y="162" class="s tx b" font-size="80" text-anchor="start" letter-spacing="-1.5">droidrt</text>
+  <text x="62" y="240" class="s tx sb" font-size="29" text-anchor="start">Android apps as native macOS apps.</text>
+  <text x="62" y="280" class="s sb" font-size="29" text-anchor="start" fill="#13874A">Scriptable through MCP.</text>
+  <rect x="62" y="312" width="146" height="34" rx="17.0" fill="#FFFFFF" stroke="#D1D9E0"/><circle cx="78" cy="329.0" r="4" fill="#3DDC84"/><text x="89" y="334.76" class="s tx sb" font-size="16" text-anchor="start">Apple Silicon</text><rect x="220.48000000000002" y="312" width="111" height="34" rx="17.0" fill="#FFFFFF" stroke="#D1D9E0"/><circle cx="236.48000000000002" cy="329.0" r="4" fill="#3DDC84"/><text x="247.48000000000002" y="334.76" class="s tx sb" font-size="16" text-anchor="start">Metal GPU</text><rect x="343.12" y="312" width="120" height="34" rx="17.0" fill="#FFFFFF" stroke="#D1D9E0"/><circle cx="359.12" cy="329.0" r="4" fill="#3DDC84"/><text x="370.12" y="334.76" class="s tx sb" font-size="16" text-anchor="start">MCP server</text>
+  <g transform="translate(650 30) scale(1.0)">
+    <clipPath id="deskclip"><rect width="600" height="340" rx="16"/></clipPath>
+    <g clip-path="url(#deskclip)">
+      <rect width="600" height="340" fill="url(#wall)"/>
+      <circle cx="491.99999999999994" cy="51.0" r="180" fill="#FFFFFF" fill-opacity="0.07"/>
+      <circle cx="60.0" cy="323.0" r="140" fill="#FFFFFF" fill-opacity="0.05"/>
+      <rect width="600" height="22" fill="#FFFFFF" fill-opacity="0.6"/>
+      <use href="#logo" x="10" y="3.5" width="15" height="15"/>
+      <rect x="34" y="8" width="44" height="6" rx="3" fill="#1F2328" fill-opacity="0.55"/>
+      <rect x="88" y="8" width="26" height="6" rx="3" fill="#1F2328" fill-opacity="0.35"/>
+      <rect x="122" y="8" width="30" height="6" rx="3" fill="#1F2328" fill-opacity="0.35"/>
+      <rect x="536" y="8" width="50" height="6" rx="3" fill="#1F2328" fill-opacity="0.45"/>
+      <g transform="translate(30 52)">
+      <rect width="164" height="236" rx="10" fill="#FFFFFF" filter="url(#sh)"/>
+      <path d="M0 26 V10 a10 10 0 0 1 10 -10 H154 a10 10 0 0 1 10 10 V26 Z" fill="#ECEFF3"/>
+      <circle cx="14" cy="13.0" r="4.5" fill="#FF5F57"/>
+      <circle cx="28" cy="13.0" r="4.5" fill="#FEBC2E"/>
+      <circle cx="42" cy="13.0" r="4.5" fill="#28C840"/>
+      <text x="96.0" y="17.5" class="s mu sb" font-size="12.5" text-anchor="middle">Chat</text>
+      <rect width="164" height="236" rx="10" fill="none" stroke="#D1D9E0" stroke-opacity="0.8"/>
+      <rect x="12" y="40" width="96" height="22" rx="11" fill="#EEF2F6"/><rect x="68" y="70" width="84" height="22" rx="11" fill="#3DDC84"/><rect x="12" y="100" width="112" height="36" rx="12" fill="#EEF2F6"/><rect x="82" y="144" width="70" height="22" rx="11" fill="#3DDC84"/><rect x="12" y="174" width="80" height="22" rx="11" fill="#EEF2F6"/><rect x="10" y="206" width="118" height="20" rx="10" fill="#EEF2F6"/><circle cx="142" cy="216" r="10" fill="#3DDC84"/><path d="M138 212 L147 216 L138 220 Z" fill="#FFFFFF"/>
+    </g>
+      <g transform="translate(408 60)">
+      <rect width="160" height="230" rx="10" fill="#FFFFFF" filter="url(#sh)"/>
+      <path d="M0 26 V10 a10 10 0 0 1 10 -10 H150 a10 10 0 0 1 10 10 V26 Z" fill="#ECEFF3"/>
+      <circle cx="14" cy="13.0" r="4.5" fill="#FF5F57"/>
+      <circle cx="28" cy="13.0" r="4.5" fill="#FEBC2E"/>
+      <circle cx="42" cy="13.0" r="4.5" fill="#28C840"/>
+      <text x="94.0" y="17.5" class="s mu sb" font-size="12.5" text-anchor="middle">Player</text>
+      <rect width="160" height="230" rx="10" fill="none" stroke="#D1D9E0" stroke-opacity="0.8"/>
+      <rect x="16" y="40" width="128" height="128" rx="10" fill="url(#art)"/>
+      <circle cx="80.0" cy="104.0" r="40.96" fill="none" stroke="#FFFFFF" stroke-opacity="0.35" stroke-width="2"/>
+      <circle cx="80.0" cy="104.0" r="23.04" fill="#FFFFFF" fill-opacity="0.25"/>
+      <rect x="16" y="180" width="86" height="8" rx="4" fill="#1F2328" fill-opacity="0.6"/>
+      <rect x="16" y="194" width="58" height="6" rx="3" fill="#59636E" fill-opacity="0.5"/>
+      <rect x="16" y="210" width="128" height="4" rx="2" fill="#EEF2F6"/>
+      <rect x="16" y="210" width="53.76" height="4" rx="2" fill="#3DDC84"/>
+      <circle cx="80.0" cy="236" r="13" fill="#3DDC84"/>
+      <path d="M76.0 229 L87.0 236 L76.0 243 Z" fill="#FFFFFF"/>
+      <path d="M46.0 230 L36.0 236 L46.0 242 Z M114.0 230 L124.0 236 L114.0 242 Z" fill="#59636E"/>
+    </g>
+      <g transform="translate(212 40)">
+      <rect width="178" height="252" rx="10" fill="#FFFFFF" filter="url(#sh)"/>
+      <path d="M0 26 V10 a10 10 0 0 1 10 -10 H168 a10 10 0 0 1 10 10 V26 Z" fill="#ECEFF3"/>
+      <circle cx="14" cy="13.0" r="4.5" fill="#FF5F57"/>
+      <circle cx="28" cy="13.0" r="4.5" fill="#FEBC2E"/>
+      <circle cx="42" cy="13.0" r="4.5" fill="#28C840"/>
+      <text x="103.0" y="17.5" class="s mu sb" font-size="12.5" text-anchor="middle">Notes</text>
+      <rect width="178" height="252" rx="10" fill="none" stroke="#D1D9E0" stroke-opacity="0.8"/>
+      <rect x="0" y="26" width="178" height="30" fill="#2F6FEB"/><rect x="14" y="37" width="64" height="8" rx="4" fill="#FFFFFF" fill-opacity="0.9"/><rect x="10" y="66" width="158" height="38" rx="8" fill="#EEF2F6"/><rect x="20" y="75" width="90" height="7" rx="3.5" fill="#1F2328" fill-opacity="0.55"/><rect x="20" y="88" width="120" height="6" rx="3" fill="#59636E" fill-opacity="0.45"/><rect x="10" y="112" width="158" height="38" rx="8" fill="#EEF2F6"/><rect x="20" y="121" width="70" height="7" rx="3.5" fill="#1F2328" fill-opacity="0.55"/><rect x="20" y="134" width="110" height="6" rx="3" fill="#59636E" fill-opacity="0.45"/><rect x="10" y="158" width="158" height="38" rx="8" fill="#EEF2F6"/><rect x="20" y="167" width="104" height="7" rx="3.5" fill="#1F2328" fill-opacity="0.55"/><rect x="20" y="180" width="84" height="6" rx="3" fill="#59636E" fill-opacity="0.45"/><rect x="10" y="204" width="158" height="38" rx="8" fill="#EEF2F6"/><rect x="20" y="213" width="60" height="7" rx="3.5" fill="#1F2328" fill-opacity="0.55"/><rect x="20" y="226" width="116" height="6" rx="3" fill="#59636E" fill-opacity="0.45"/><circle cx="150" cy="224" r="16" fill="#3DDC84" filter="url(#sh2)"/><path d="M150 217 V231 M143 224 H157" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round"/>
+    </g>
+      <rect x="209.0" y="298" width="182" height="34" rx="11" fill="#FFFFFF" fill-opacity="0.6" stroke="#FFFFFF" stroke-opacity="0.18"/>
+      <rect x="222.0" y="306" width="18" height="18" rx="5" fill="#3DDC84"/><rect x="248.0" y="306" width="18" height="18" rx="5" fill="#4C8DFF"/><rect x="274.0" y="306" width="18" height="18" rx="5" fill="#A78BFA"/><rect x="300.0" y="306" width="18" height="18" rx="5" fill="#F5A524"/><rect x="326.0" y="306" width="18" height="18" rx="5" fill="#FF6B6B"/><rect x="352.0" y="306" width="18" height="18" rx="5" fill="#22C3D6"/><use href="#logo" x="377.0" y="305" width="20" height="20"/>
+    </g>
+    <rect width="600" height="340" rx="16" fill="none" stroke="#FFFFFF" stroke-opacity="0.12"/>
+  </g>
+</svg>

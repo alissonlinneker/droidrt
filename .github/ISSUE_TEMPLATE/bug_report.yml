@@ -1,0 +1,94 @@
+name: Bug report
+description: Something in droidrt does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please check the
+        [known limits](https://github.com/alissonlinneker/droidrt/blob/main/docs/compatibility.md)
+        first: 32-bit ARM apps, x86-only apps, Play Integrity DEVICE/STRONG, Widevine L1 and
+        FLAG_SECURE screens cannot work on any Mac setup.
+
+        Never attach APK files or anything that contains personal data (chats, phone numbers, tokens).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. droidrt install ~/Downloads/app.apk
+        2. open ~/Applications/Android/App.app
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "e.g. 26.1 (sw_vers -productVersion)"
+    validations:
+      required: true
+  - type: dropdown
+    id: chip
+    attributes:
+      label: Chip
+      options:
+        - M1 family
+        - M2 family
+        - M3 family
+        - M4 family
+        - M5 family or newer
+    validations:
+      required: true
+  - type: input
+    id: emulator
+    attributes:
+      label: Android Emulator version
+      placeholder: "emulator -version (first line)"
+    validations:
+      required: true
+  - type: input
+    id: scrcpy
+    attributes:
+      label: scrcpy version
+      placeholder: "scrcpy --version (first line)"
+    validations:
+      required: true
+  - type: input
+    id: image
+    attributes:
+      label: System image
+      description: The value of DROIDRT_IMAGE, if you changed it.
+      placeholder: "system-images;android-37.0;google_apis_playstore;arm64-v8a"
+  - type: input
+    id: droidrt
+    attributes:
+      label: droidrt commit
+      placeholder: "git rev-parse --short HEAD"
+    validations:
+      required: true
+  - type: input
+    id: app
+    attributes:
+      label: App involved (if any)
+      description: Package name, version and where you got it (Play Store inside droidrt, official website, F-Droid).
+      placeholder: "com.example.app 1.2.3, Play Store"
+  - type: textarea
+    id: env
+    attributes:
+      label: DROIDRT_* environment variables
+      description: Any variable you set (DROIDRT_GPU, DROIDRT_CAMERA and so on).
+      render: shell
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant lines from ~/Library/Logs/droidrt/ (vm.log, <package>.log, launcher logs). Remove personal data first.
+      render: text

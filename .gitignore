@@ -1,0 +1,40 @@
+# Local tooling
+.memory-bank/
+.mcp.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+iconkit/build/
+compat/out/
+
+# Build outputs
+launcher/build/
+agent-apk/build/
+build/
+graphify-out/
+
+# Never commit apps or signing keys
+*.apk
+*.xapk
+*.apks
+*.apkm
+*.aab
+*.keystore
+*.jks
+local.properties
+
+# macOS
+.DS_Store
+._*
+
+# Secrets and logs
+*.log
+*.key
+*.pem
+*.p12
+*.idsig
+.env
+.env.*

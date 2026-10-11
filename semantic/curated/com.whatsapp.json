@@ -1,0 +1,107 @@
+{
+  "package": "com.whatsapp",
+  "slug": "whatsapp",
+  "sources": [
+    "https://faq.whatsapp.com/5913398998672934 (How to use click to chat: https://wa.me/<number>?text=<urlencoded text>, number in full international format without '+', zeroes, brackets or dashes)",
+    "https://developer.android.com/training/sharing/send (ACTION_SEND with text/plain and EXTRA_TEXT)"
+  ],
+  "tools": [
+    {
+      "name": "whatsapp_open_chat",
+      "description": "Open the WhatsApp chat with a phone number through the official click to chat link (wa.me). Use only with your own account and in line with the WhatsApp Terms of Service.",
+      "package": "com.whatsapp",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "phone": {"type": "string", "description": "Full phone number in international format, country code first, for example 5511999999999. Anything that is not a digit is removed."}
+        },
+        "required": ["phone"]
+      },
+      "action": {
+        "type": "intent",
+        "action": "android.intent.action.VIEW",
+        "data": "https://wa.me/{phone|digits}",
+        "package": "com.whatsapp",
+        "component": null,
+        "extras": {},
+        "mimeType": null,
+        "categories": ["android.intent.category.BROWSABLE"]
+      }
+    },
+    {
+      "name": "whatsapp_draft_message",
+      "description": "Open the WhatsApp chat with a phone number and prefill a message without sending it, through the official click to chat link (wa.me). Use only with your own account and in line with the WhatsApp Terms of Service.",
+      "package": "com.whatsapp",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "phone": {"type": "string", "description": "Full phone number in international format, country code first, for example 5511999999999. Anything that is not a digit is removed."},
+          "text": {"type": "string", "description": "Message to place in the chat input."}
+        },
+        "required": ["phone", "text"]
+      },
+      "action": {
+        "type": "intent",
+        "action": "android.intent.action.VIEW",
+        "data": "https://wa.me/{phone|digits}?text={text|urlencode}",
+        "package": "com.whatsapp",
+        "component": null,
+        "extras": {},
+        "mimeType": null,
+        "categories": ["android.intent.category.BROWSABLE"]
+      }
+    },
+    {
+      "name": "whatsapp_send_message",
+      "description": "Send a WhatsApp message to a phone number: opens the chat through the official click to chat link (wa.me) with the text prefilled, waits for the Send button and taps it. The button lookup uses the content description \"Send\", so it expects an English UI. Use only with your own account, never for bulk or unsolicited messages, and in line with the WhatsApp Terms of Service.",
+      "package": "com.whatsapp",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "phone": {"type": "string", "description": "Full phone number in international format, country code first, for example 5511999999999. Anything that is not a digit is removed."},
+          "text": {"type": "string", "description": "Message to send."}
+        },
+        "required": ["phone", "text"]
+      },
+      "action": {
+        "type": "flow",
+        "steps": [
+          {"intent": {
+            "type": "intent",
+            "action": "android.intent.action.VIEW",
+            "data": "https://wa.me/{phone|digits}?text={text|urlencode}",
+            "package": "com.whatsapp",
+            "component": null,
+            "extras": {},
+            "mimeType": null,
+            "categories": ["android.intent.category.BROWSABLE"]
+          }},
+          {"wait": {"contentDesc": "Send", "timeoutMs": 15000}},
+          {"tap": {"contentDesc": "Send"}}
+        ]
+      }
+    },
+    {
+      "name": "whatsapp_share_text",
+      "description": "Share plain text with WhatsApp through the standard Android share intent (ACTION_SEND, text/plain). WhatsApp then asks which chat to send it to. Use only with your own account and in line with the WhatsApp Terms of Service.",
+      "package": "com.whatsapp",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {"type": "string", "description": "Text to share."}
+        },
+        "required": ["text"]
+      },
+      "action": {
+        "type": "intent",
+        "action": "android.intent.action.SEND",
+        "data": null,
+        "package": "com.whatsapp",
+        "component": null,
+        "extras": {"android.intent.extra.TEXT": "{text}"},
+        "mimeType": "text/plain",
+        "categories": []
+      }
+    }
+  ]
+}

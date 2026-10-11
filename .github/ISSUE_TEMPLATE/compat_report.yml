@@ -1,0 +1,97 @@
+name: Compatibility report
+description: Tell us how a specific Android app behaves on droidrt (works, partly works or fails).
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Compatibility reports help everyone. Reports for apps that work are as useful as failures.
+        Do not attach the APK. Mention where it came from instead.
+  - type: input
+    id: app
+    attributes:
+      label: App name and package
+      placeholder: "LocalSend, org.localsend.localsend_app"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: App version
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Where the app came from
+      options:
+        - Play Store inside droidrt
+        - Official website of the developer
+        - F-Droid
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - Works
+        - Works with issues
+        - Opens but core features fail
+        - Does not open or install
+    validations:
+      required: true
+  - type: checkboxes
+    id: features
+    attributes:
+      label: What did you test?
+      options:
+        - label: Login or account setup
+        - label: Camera
+        - label: Microphone
+        - label: Audio playback
+        - label: Video playback
+        - label: Notifications
+        - label: Keyboard and text input
+        - label: Location
+        - label: File sharing (drag and drop, share sheet)
+  - type: textarea
+    id: notes
+    attributes:
+      label: Details
+      description: What works, what does not, and any error message shown by the app.
+    validations:
+      required: true
+  - type: input
+    id: abis
+    attributes:
+      label: Native ABIs (if known)
+      description: For example from `unzip -l app.apk | grep lib/`. arm64-v8a or none is required.
+      placeholder: "arm64-v8a"
+  - type: input
+    id: mac
+    attributes:
+      label: Mac and macOS version
+      placeholder: "M2 Max, macOS 26.1"
+    validations:
+      required: true
+  - type: input
+    id: emulator
+    attributes:
+      label: Android Emulator and scrcpy versions
+      placeholder: "emulator 37.x, scrcpy 5.x"
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: DROIDRT_* variables used
+      description: For example DROIDRT_GPU=software if the default renderer showed artifacts.
+      render: shell
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant lines from ~/Library/Logs/droidrt/ or `adb logcat -b crash`. Remove personal data first.
+      render: text

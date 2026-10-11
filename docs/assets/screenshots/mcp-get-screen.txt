@@ -1,0 +1,38 @@
+package org.breezyweather, display 5 (720x1560); screenshot 472x1024, multiply screenshot coordinates by 1.5254 to get display pixels
+window w24:0 pkg=org.breezyweather display=5 @0,0,720,1560
+  [w24:0.0.0.0] LinearLayout id=action_bar_root @0,0,720,1560
+    [w24:0.0.0.0.0] FrameLayout id=content @0,0,720,1560
+      [w24:0.0.0.0.0.0] ViewGroup id=container @0,0,720,1560
+        [w24:0.0.0.0.0.0.3] FrameLayout id=fragment @0,0,720,1560
+          [w24:0.0.0.0.0.0.3.0] ViewGroup id=fragment_root @0,0,720,1560
+            [w24:0.0.0.0.0.0.3.0.1.0] LinearLayout id=appBar @0,0,720,128
+              [w24:0.0.0.0.0.0.3.0.1.0.0] ViewGroup id=toolbar @0,0,720,128
+                [w24:0.0.0.0.0.0.3.0.1.0.0.0] ImageButton desc="Location list" {clickable} @0,8,112,120
+                [w24:0.0.0.0.0.0.3.0.1.0.0.1] TextView "Paris" @120,37,215,91
+                [w24:0.0.0.0.0.0.3.0.1.0.0.2.0] Button desc="Edit this location" id=action_edit {clickable} @528,16,624,112
+                [w24:0.0.0.0.0.0.3.0.1.0.0.2.1] ImageView desc="More options" {clickable} @624,16,704,112
+            [w24:0.0.0.0.0.0.3.0.1.1.0] FrameLayout id=switch_layout {disabled} @0,128,720,1560
+              [w24:0.0.0.0.0.0.3.0.1.1.0.0] ViewGroup id=refresh_layout @0,128,720,1560
+                [w24:0.0.0.0.0.0.3.0.1.1.0.0.0] GridView id=recycler_view {scrollable} @0,128,720,1560
+                  [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.0] LinearLayout id=container_main_header @16,128,704,698
+                    [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.0.0.0] TextView "34 min. ago" desc="Last updated 34 min. ago" id=refreshTimeText @32,128,688,176
+                    [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.0.1] TextView "Partly cloudy" id=container_main_header_weather_condition_description @235,208,485,260
+                    [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.0.2] RelativeLayout desc="62 degrees Fahrenheit" id=container_main_header_temperature @32,260,688,568
+                      [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.0.2.0] TextView "62" id=container_main_header_temperature_value @199,260,521,568
+                      [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.0.2.1] TextView "°F" id=container_main_header_temperature_unit @521,270,615,387
+                    [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.0.3] TextView "Feels like 58°" desc="Feels like: 58 degrees Fahrenheit" id=container_main_header_feels_like @232,548,487,607
+                    [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.0.4] TextView "Night: 51° • Day: 60°" desc="Night: 51 degrees Fahrenheit • Day: 60 degrees Fahrenheit" id=container_main_header_temperature_range @216,623,503,666
+                  [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.1] CardView id=container_main_daily_trend_card @32,714,688,1521
+                    [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.1.0.0] ImageView id=daily_block_title_icon @72,752,120,800
+                    [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.1.0.1] TextView "Daily forecast" id=daily_block_title @136,754,336,797
+                    [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.1.0.2] LinearLayout id=daily_block_button_group @72,813,570,909
+                      [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.1.0.2.0] CompoundButton "Conditions" {clickable,checked} @72,813,273,909
+                      [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.1.0.2.1] CompoundButton "Air quality" {clickable,unchecked} @277,813,470,909
+                    [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.1.0.3] RecyclerView id=daily_block_trendRecyclerView {scrollable} @32,925,688,1521
+                      [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.1.0.3.0] ViewGroup desc="Conditions, Today, October 11, Daytime: 63 degrees Fahrenheit, Cloudy, Precipitation probability: 3%, Nighttime: 51 d..." id=item_trend_daily {clickable} @32,925,150,1521
+                      [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.1.0.3.1] ViewGroup desc="Conditions, Tomorrow, October 12, Daytime: 60 degrees Fahrenheit, Cloudy, Precipitation probability: 10%, Nighttime: ..." id=item_trend_daily {clickable} @150,925,268,1521
+                      [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.1.0.3.2] ViewGroup desc="Conditions, Tuesday, October 13, Daytime: 75 degrees Fahrenheit, Cloudy, Precipitation probability: 14%, Nighttime: 5..." id=item_trend_daily {clickable} @268,925,386,1521
+                      [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.1.0.3.3] ViewGroup desc="Conditions, Wednesday, October 14, Daytime: 67 degrees Fahrenheit, Partly cloudy, Precipitation probability: 4%, Nigh..." id=item_trend_daily {clickable} @386,925,504,1521
+                      [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.1.0.3.4] ViewGroup desc="Conditions, Thursday, October 15, Daytime: 76 degrees Fahrenheit, Clear sky, Precipitation probability: 5%, Nighttime..." id=item_trend_daily {clickable} @504,925,622,1521
+                      [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.1.0.3.5] ViewGroup desc="Conditions, Friday, October 16, Daytime: 61 degrees Fahrenheit, Cloudy, Precipitation probability: 15%, Nighttime: 48..." id=item_trend_daily {clickable} @622,925,688,1521
+                  [w24:0.0.0.0.0.0.3.0.1.1.0.0.0.2] CardView id=container_main_hourly_trend_card @32,1553,688,1560

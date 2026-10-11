@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">droidrt agent</string>
+    <string name="a11y_label">droidrt agent</string>
+    <string name="a11y_description">Lets the droidrt host read the screen and perform taps, swipes and text input on your behalf. It only answers requests coming from adb on the host.</string>
+    <string name="notify_label">droidrt notifications</string>
+</resources>

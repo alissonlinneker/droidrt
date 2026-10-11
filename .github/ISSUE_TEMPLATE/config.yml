@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/alissonlinneker/droidrt/security/advisories/new
+    about: Please report vulnerabilities privately through a GitHub Security Advisory, not in a public issue.
+  - name: Compatibility notes
+    url: https://github.com/alissonlinneker/droidrt/blob/main/docs/compatibility.md
+    about: Read the known limits (32-bit ARM, x86-only apps, Play Integrity, DRM) before opening an issue.
