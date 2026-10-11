@@ -42,6 +42,7 @@ Each Android app gets its own `.app` bundle in `~/Applications/Android`, with it
 - [Development](#development)
 - [Legal notice](#legal-notice)
 - [Credits](#credits)
+- [Support the project](#support-the-project)
 - [License](#license)
 
 ## Why
@@ -151,7 +152,7 @@ Dragging an APK onto any app window installs it. Dragging any other file copies 
 | `droidrt sync` | Creates or removes launchers to match the apps installed in the VM. |
 | `droidrt list` | Lists installed launchers. |
 | `droidrt uninstall <package>` | Uninstalls the app and removes its launcher. |
-| `droidrt geo <lat> <lon>` | Sets the GPS location of the VM, for example `droidrt geo -23.5505 -46.6333`. |
+| `droidrt geo <lat> <lon>` | Sets the GPS location of the VM, for example `droidrt geo 48.8584 2.2945`. Apps with an active location request receive it right away through the `gps` and `fused` providers. |
 | `droidrt setup` | Creates or updates the headless AVD. |
 | `droidrt start` / `droidrt stop` | Starts the VM and waits for boot, or stops it. |
 | `droidrt status` | Shows the VM state. |
@@ -223,6 +224,7 @@ Some limits cannot be worked around by any Android setup on a Mac:
 | `DROIDRT_AUDIO` | `1` | `0` disables VM audio |
 | `DROIDRT_GPU` | `host` | `software` if an app shows graphical artifacts (uses the CPU, exposes GLES 3.1) |
 | `DROIDRT_DISPLAY` | `720x1560/320` | initial size and DPI of each app display |
+| `DROIDRT_RESIZABLE` | `0` | `1` makes app windows resizable: the Android display follows the window size and the app adapts its layout. The display is sized in macOS points, so on Retina screens the video has half the pixel density of the fixed size window and text looks softer |
 | `DROIDRT_MAX_FPS` | `30` | frame rate cap for the window video (use 60 for games) |
 | `DROIDRT_BITRATE` | `6M` | bitrate of the window video |
 | `DROIDRT_IDLE_GRACE` | `120` | seconds without windows before the VM shuts down |
@@ -293,6 +295,10 @@ The software is provided "as is", without warranty of any kind. See [LICENSE](LI
 - [Android Emulator](https://developer.android.com/studio/run/emulator) and the [Android Open Source Project](https://source.android.com/) (Apache-2.0), which provide the VM and the system.
 - [scrcpy](https://github.com/Genymobile/scrcpy) by Genymobile (Apache-2.0), which provides the per-app windows, input and clipboard.
 - The open source apps from [F-Droid](https://f-droid.org/) used in the compatibility matrix, under their own licenses.
+
+## Support the project
+
+droidrt is free and open source. If it saves you time, consider [sponsoring its development on GitHub](https://github.com/sponsors/alissonlinneker). Bug reports, compatibility reports and pull requests help just as much.
 
 ## License
 

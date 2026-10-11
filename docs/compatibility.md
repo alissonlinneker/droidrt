@@ -78,7 +78,8 @@ These cannot be solved by droidrt or by any other Android setup on a Mac:
 | Microphone | Off by default. `DROIDRT_MIC=1` passes the Mac microphone through. |
 | Keyboard | Physical keyboard and IME per window. |
 | Clipboard | Shared both ways. |
-| Location | Set with `droidrt geo <lat> <lon>`. |
+| Location | Set with `droidrt geo <lat> <lon>`. The fix reaches the `gps` and `fused` providers, so apps with an active request (checked with Organic Maps) follow it. |
+| Window size | Fixed by default. `DROIDRT_RESIZABLE=1` makes windows resizable (scrcpy flex display): the Android display follows the window, sized in points, so the video is softer on Retina screens. |
 | Files | Drag a file onto a window to copy it to `/sdcard/Download`; drag an APK to install it. |
 
 ## Apps that need a phone number

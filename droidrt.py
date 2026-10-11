@@ -44,6 +44,8 @@ APPS_DIR = Path(os.environ.get("DROIDRT_APPS_DIR", HOME / "Applications/Android"
 STATE_DIR = HOME / "Library/Application Support/droidrt"
 LOG_DIR = HOME / "Library/Logs/droidrt"
 DISPLAY = os.environ.get("DROIDRT_DISPLAY", "720x1560/320")
+# Opt-in resizable windows (scrcpy --flex-display). Off by default: see flex_display_spec().
+RESIZABLE = os.environ.get("DROIDRT_RESIZABLE", "0") == "1"
 IDLE_GRACE = int(os.environ.get("DROIDRT_IDLE_GRACE", "120"))
 MAX_FPS = os.environ.get("DROIDRT_MAX_FPS", "30")
 BOOT_TIMEOUT = 240
@@ -533,16 +535,37 @@ def launch(package: str, title: str | None) -> int:
     return code
 
 
+def flex_display_spec(spec: str) -> str:
+    """Display spec for a resizable window, in macOS points instead of pixels.
+
+    scrcpy's flex display sizes the Android display from the window size in points
+    and draws one video pixel per point. A pixel sized spec such as 720x1560/320
+    then needs a 720x1560 point window, twice the physical size on a Retina screen:
+    the window is clamped to the screen without resizing the display, so the frame
+    shows zoomed and cropped, and later resizes keep 320 dpi on a point sized
+    display, which doubles the UI. Halving size and density keeps the same layout
+    in dp (360x780/160 is 360x780 dp, like 720x1560/320), at the cost of a frame
+    with half the pixels of the fixed size window.
+    """
+    m = re.fullmatch(r"(\d+)x(\d+)(?:/(\d+))?", spec)
+    if not m:
+        raise DroidError(f"invalid DROIDRT_DISPLAY '{spec}' (expected WIDTHxHEIGHT/DPI)")
+    width, height = (max(2, int(v) // 2 // 2 * 2) for v in m.group(1, 2))
+    return f"{width}x{height}" + (f"/{max(1, int(m.group(3)) // 2)}" if m.group(3) else "")
+
+
+def window_command(package: str, title: str | None, resizable: bool = RESIZABLE) -> list[str]:
+    display = ["--flex-display", f"--new-display={flex_display_spec(DISPLAY)}"] if resizable else [f"--new-display={DISPLAY}"]
+    return [tool("scrcpy"), "-s", SERIAL, *display, f"--start-app={package}",
+            "--display-ime-policy=local", "--keyboard=uhid",
+            "--video-codec=h264", "--video-encoder=c2.android.avc.encoder", f"--video-bit-rate={VIDEO_BITRATE}",
+            "--no-vd-system-decorations", "--no-audio", "--window-title", title or package,
+            "--stay-awake", f"--max-fps={MAX_FPS}"]
+
+
 def run_window(package: str, title: str | None) -> int:
     with open(LOG_DIR / f"{package}.log", "ab") as out:
-        return subprocess.call(
-            [tool("scrcpy"), "-s", SERIAL, f"--new-display={DISPLAY}", f"--start-app={package}",
-             "--display-ime-policy=local", "--keyboard=uhid",
-             "--video-codec=h264", "--video-encoder=c2.android.avc.encoder", f"--video-bit-rate={VIDEO_BITRATE}",
-             "--no-vd-system-decorations", "--no-audio", "--window-title", title or package,
-             "--stay-awake", f"--max-fps={MAX_FPS}"],
-            stdout=out, stderr=out,
-        )
+        return subprocess.call(window_command(package, title), stdout=out, stderr=out)
 
 
 def launchers() -> dict[str, tuple[Path, dict]]:
@@ -627,7 +650,8 @@ def set_location(lat: float, lon: float) -> None:
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         raise DroidError("latitude must be within -90..90 and longitude within -180..180")
     start()
-    # The emulator console takes longitude first.
+    # The emulator console takes longitude first. The fix reaches the gps provider and,
+    # through it, the fused provider, so apps with an active location request get it.
     out = adb("emu", "geo", "fix", f"{lon:.6f}", f"{lat:.6f}", timeout=10)
     if "OK" not in out:
         raise DroidError(f"geo fix failed: {out.strip()}")

@@ -432,13 +432,20 @@ class XmlNode:
     children: list
 
 
-def parse_resources_dump(text: str, apk: Path, table: dict, paths: dict) -> None:
-    """Parse `aapt2 dump resources` output into {resid: [Entry]} and {path: resid}."""
+def parse_resources_dump(text: str, apk: Path, table: dict, paths: dict, names: dict | None = None) -> None:
+    """Parse `aapt2 dump resources` output into {resid: [Entry]} and {path: resid}.
+
+    When `names` is given it also receives {"type/name": resid}. aapt2 prints
+    references between entries of the app package by name (`@color/logo`),
+    not by id, so this index is needed to follow them.
+    """
     current = None
     for line in text.splitlines():
         m = re.match(r"^\s+resource (0x[0-9a-fA-F]{8}) (\S+)", line)
         if m:
             current = int(m.group(1), 16)
+            if names is not None:
+                names.setdefault(m.group(2), current)
             continue
         if current is None:
             continue
@@ -497,12 +504,14 @@ class Resources:
         self.workdir = workdir
         self.table: dict[int, list[Entry]] = {}
         self.paths: dict[str, int] = {}
+        self.names: dict[str, int] = {}
         self._xml: dict[tuple, XmlNode | None] = {}
         self._best: dict[tuple, Entry | None] = {}
         self._zips: dict[str, zipfile.ZipFile | None] = {}
         self._n = 0
         for apk in apks:
-            parse_resources_dump(_run([aapt2, "dump", "resources", str(apk)]), apk, self.table, self.paths)
+            parse_resources_dump(_run([aapt2, "dump", "resources", str(apk)]), apk, self.table, self.paths,
+                                 self.names)
 
     def close(self) -> None:
         for z in self._zips.values():
@@ -590,6 +599,18 @@ class Resources:
 def _ref_id(value: str) -> int | None:
     m = re.fullmatch(r"@\+?(?:\w+:)?(0x[0-9a-fA-F]{8})", value.strip())
     return int(m.group(1), 16) if m else None
+
+
+def _ref_name(value: str) -> str | None:
+    """'type/name' of a symbolic reference such as '@color/logo' or '@pkg:drawable/bg'.
+
+    Framework references ('@android:...') are left out: aapt2 prints those by
+    id and the app resource table cannot answer them anyway.
+    """
+    m = re.fullmatch(r"@\+?(?:([\w.]+):)?(\w+/[\w.]+)", value.strip())
+    if not m or m.group(1) == "android":
+        return None
+    return m.group(2)
 
 
 def _num(value, default: float = 0.0) -> float:
@@ -693,6 +714,15 @@ class Resolver:
         self._memo[memo_key] = (result, self.nodes - n0, self.path_ops - p0)
         return result
 
+    def _rid(self, value: str) -> int | None:
+        """Resource id of an '@0x...' or '@type/name' reference, None otherwise."""
+        rid = _ref_id(value)
+        if rid is None and self.r:
+            name = _ref_name(value)
+            if name is not None:
+                rid = self.r.names.get(name)
+        return rid
+
     # ---- colors and paints
 
     def color(self, value, depth: int = 0) -> RGBA | None:
@@ -711,7 +741,7 @@ class Resolver:
         v = str(value).strip()
         if c := parse_color(v):
             return {"color": list(c)}
-        rid = _ref_id(v)
+        rid = self._rid(v)
         if rid is None:
             return None
         if rid in FRAMEWORK_COLORS:
@@ -767,7 +797,7 @@ class Resolver:
         if value is None or depth > MAX_DEPTH:
             return 0.0
         v = str(value).strip()
-        rid = _ref_id(v)
+        rid = self._rid(v)
         if rid is not None and self.r:
             self._charge()
             e = self.r.best(rid)
@@ -784,7 +814,7 @@ class Resolver:
         if value is None or depth > MAX_DEPTH:
             return default
         v = str(value).strip()
-        rid = _ref_id(v)
+        rid = self._rid(v)
         if rid is not None and self.r:
             self._charge()
             e = self.r.best(rid)
@@ -801,7 +831,7 @@ class Resolver:
         v = str(value).strip()
         if c := parse_color(v):
             return {"type": "color", "color": list(c)}
-        rid = _ref_id(v)
+        rid = self._rid(v)
         if rid is None:
             return None
         if rid in FRAMEWORK_COLORS:

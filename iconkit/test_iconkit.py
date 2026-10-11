@@ -201,6 +201,28 @@ class AaptParsingTest(unittest.TestCase):
         self.assertEqual([e.config for e in table[0x7F0F0001]], ["mdpi", "xxxhdpi"])
         self.assertEqual(paths["res/b.png"], 0x7F0F0001)
 
+    def test_resources_dump_names(self):
+        # aapt2 prints references inside the app package by name, not by id.
+        text = (
+            "Package name=x id=7f\n"
+            "  type color id=06 entryCount=2\n"
+            "    resource 0x7f060010 color/ic_launcher_background\n"
+            "      () @color/brand\n"
+            "    resource 0x7f060011 color/brand\n"
+            "      () #ff123456\n"
+        )
+        table, paths, names = {}, {}, {}
+        ik.parse_resources_dump(text, Path("base.apk"), table, paths, names)
+        self.assertEqual(names, {"color/ic_launcher_background": 0x7F060010, "color/brand": 0x7F060011})
+        self.assertEqual(table[0x7F060010][0].value, "@color/brand")
+
+    def test_ref_name(self):
+        self.assertEqual(ik._ref_name("@color/brand"), "color/brand")
+        self.assertEqual(ik._ref_name("@x.y:drawable/bg_icon"), "drawable/bg_icon")
+        self.assertIsNone(ik._ref_name("@android:color/white"))
+        self.assertIsNone(ik._ref_name("@0x7f060010"))
+        self.assertIsNone(ik._ref_name("?attr/colorPrimary"))
+
 
 # ---------------------------------------------------------------- hardening
 
@@ -422,6 +444,36 @@ class ResolverBudgetTest(unittest.TestCase):
         self.assertEqual(spec["background"], {"type": "color", "color": [0x25, 0xD3, 0x66, 255]})
         self.assertEqual(spec["foreground"]["type"], "vector")
         self.assertEqual(spec["foreground"]["children"][0]["kind"], "path")
+
+    def test_adaptive_background_via_named_reference(self):
+        # The background points at a color entry whose value is a symbolic
+        # reference to another color entry (and a shape that does the same).
+        bg, brand, fg, shape = 0x7F060010, 0x7F060011, 0x7F080002, 0x7F080003
+        adaptive = ik.XmlNode("adaptive-icon", {}, [
+            ik.XmlNode("background", {"drawable": f"@0x{bg:08x}"}, []),
+            ik.XmlNode("foreground", {"drawable": f"@0x{shape:08x}"}, []),
+        ])
+        oval = ik.XmlNode("shape", {"shape": "oval"}, [ik.XmlNode("solid", {"color": "@color/brand"}, [])])
+        res = FakeResources(self.work, {LOOP: "(file) res/mipmap-anydpi-v26/ic.xml", bg: "@color/brand",
+                                        brand: "#ff123456", fg: "@color/missing",
+                                        shape: "(file) res/drawable/s.xml"},
+                            {"res/mipmap-anydpi-v26/ic.xml": adaptive, "res/drawable/s.xml": oval})
+        res.names.update({"color/ic_launcher_background": bg, "color/brand": brand,
+                          "drawable/s": shape})
+        spec = self.resolve(res)
+        self.assertEqual(spec["background"], {"type": "color", "color": [0x12, 0x34, 0x56, 255]})
+        self.assertEqual(spec["foreground"]["fill"], {"color": [0x12, 0x34, 0x56, 255]})
+        resolver = ik.Resolver(res)
+        self.assertEqual(resolver.drawable("@color/brand", 108), {"type": "color", "color": [0x12, 0x34, 0x56, 255]})
+        self.assertIsNone(resolver.drawable("@color/missing", 108))
+        self.assertIsNone(resolver.drawable(f"@0x{fg:08x}", 108))
+
+    def test_named_reference_cycle(self):
+        a, b = 0x7F060020, 0x7F060021
+        res = FakeResources(self.work, {a: "@color/b", b: "@color/a"}, {})
+        res.names.update({"color/a": a, "color/b": b})
+        self.assertIsNone(ik.Resolver(res).drawable("@color/a", 108))
+        self.assertIsNone(ik.Resolver(res).color("@color/a"))
 
 
 @unittest.skipUnless(ik.COMPOSE_BIN.is_file(), "build/compose not built (run build.sh)")

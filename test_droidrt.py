@@ -3,6 +3,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 import droidrt
 
@@ -82,6 +83,39 @@ class ParseTests(unittest.TestCase):
             cfg.write_text("hw.ramSize=1536\nabi.type=arm64-v8a\n")
             droidrt.apply_avd_settings(cfg, {"hw.ramSize": "2048"})
             self.assertEqual(cfg.read_text().splitlines(), ["abi.type=arm64-v8a", "hw.ramSize=2048"])
+
+
+class WindowTests(unittest.TestCase):
+    def test_flex_display_spec_is_in_points(self):
+        self.assertEqual(droidrt.flex_display_spec("720x1560/320"), "360x780/160")
+        self.assertEqual(droidrt.flex_display_spec("1081x1921/420"), "540x960/210")
+        self.assertEqual(droidrt.flex_display_spec("720x1560"), "360x780")
+        with self.assertRaises(droidrt.DroidError):
+            droidrt.flex_display_spec("big")
+
+    def test_window_command_fixed_by_default(self):
+        with mock.patch.object(droidrt, "tool", return_value="scrcpy"), mock.patch.object(droidrt, "DISPLAY", "720x1560/320"):
+            fixed = droidrt.window_command("org.example", None, resizable=False)
+            flex = droidrt.window_command("org.example", "Example", resizable=True)
+        self.assertIn("--new-display=720x1560/320", fixed)
+        self.assertNotIn("--flex-display", fixed)
+        self.assertIn("--flex-display", flex)
+        self.assertIn("--new-display=360x780/160", flex)
+        self.assertEqual(flex[flex.index("--window-title") + 1], "Example")
+
+
+class LocationTests(unittest.TestCase):
+    def test_geo_fix_sends_longitude_first(self):
+        with mock.patch.object(droidrt, "start"), mock.patch.object(droidrt, "adb", return_value="OK\n") as adb:
+            droidrt.set_location(48.8584, 2.2945)
+        adb.assert_called_once_with("emu", "geo", "fix", "2.294500", "48.858400", timeout=10)
+
+    def test_geo_rejects_out_of_range_and_console_errors(self):
+        with self.assertRaises(droidrt.DroidError):
+            droidrt.set_location(91, 0)
+        with mock.patch.object(droidrt, "start"), mock.patch.object(droidrt, "adb", return_value="KO: bad\n"):
+            with self.assertRaises(droidrt.DroidError):
+                droidrt.set_location(0, 0)
 
 
 class PackageTests(unittest.TestCase):
