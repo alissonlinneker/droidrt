@@ -15,7 +15,10 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .schema import PACKAGE_RE, app_slug, clean_text, prefixed_name, sanitize_name
+from .schema import (
+    DANGEROUS_SCHEMES, MAX_DESCRIPTION, NAME_RE, ToolError, app_slug, clean_text, package_ok,
+    prefixed_name, sanitize_name, validate_tool,
+)
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +36,8 @@ TOOL_LIMIT = 15
 AAPT2_TIMEOUT = 60
 MAX_APKS = 32
 MAX_PATHS_IN_DESCRIPTION = 4
+MAX_PATH_IN_DESCRIPTION = 60   # characters of one declared path shown to the model
+MAX_NAME_IN_DESCRIPTION = 60   # characters of an activity class name shown to the model
 
 # Framework attribute resource ids. aapt2 prints them next to the name, and
 # they survive when a shrinker strips the attribute names from the manifest.
@@ -57,17 +62,17 @@ ATTR_IDS = {
 
 # Schemes that never make sense as an agent tool: local files, content
 # providers that need grants, and URL kinds that run code.
-SKIP_SCHEMES = frozenset({"file", "content", "data", "javascript", "about", "intent", "android-app", "*"})
+SKIP_SCHEMES = DANGEROUS_SCHEMES | {"*"}
 
-SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.-]{0,31}$")
-HOST_RE = re.compile(r"^[a-z0-9_](?:[a-z0-9_-]{0,62})(?:\.[a-z0-9_](?:[a-z0-9_-]{0,62}))*$")
-PORT_RE = re.compile(r"^[0-9]{1,5}$")
-CLASS_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*$")
-MIME_RE = re.compile(r"^[A-Za-z0-9*.+-]+/[A-Za-z0-9*.+-]+$")
-ACTION_RE = re.compile(r"^[A-Za-z0-9_.$]{1,200}$")
+SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.-]{0,31}\Z", re.ASCII)
+HOST_RE = re.compile(r"^[a-z0-9_](?:[a-z0-9_-]{0,62})(?:\.[a-z0-9_](?:[a-z0-9_-]{0,62}))*\Z", re.ASCII)
+PORT_RE = re.compile(r"^[0-9]{1,5}\Z", re.ASCII)
+CLASS_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\Z", re.ASCII)
+MIME_RE = re.compile(r"^[A-Za-z0-9*.+-]+/[A-Za-z0-9*.+-]+\Z", re.ASCII)
+ACTION_RE = re.compile(r"^[A-Za-z0-9_.$]{1,200}\Z", re.ASCII)
 
 LINE_RE = re.compile(r"^(?P<indent> *)(?P<kind>[ENA]): (?P<rest>.*)$")
-ELEMENT_RE = re.compile(r"^(?P<tag>[A-Za-z0-9_:.-]+)(?: \(line=\d+\))?$")
+ELEMENT_RE = re.compile(r"^(?P<tag>[A-Za-z0-9_:.-]+)(?: \(line=\d+\))?\Z", re.ASCII)
 ATTR_RE = re.compile(
     r"^(?:(?P<ns>\S*?):)?(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)?"
     r"(?:\((?P<rid>0x[0-9a-fA-F]+)\))?=(?P<value>.*)$"
@@ -340,14 +345,19 @@ def _valid_host(host: str) -> bool:
 
 def _data_spec(el: Element) -> DataSpec:
     a = el.attrs
-    scheme = (a.get("scheme") or "").lower() or None
-    host = (a.get("host") or "").lower() or None
+    # Lowercase only ASCII: str.lower() maps some non ASCII letters onto ASCII
+    # ones (KELVIN SIGN becomes "k"), which would turn a host the app never
+    # declared into a valid looking one.
+    scheme = a.get("scheme") or None
+    scheme = scheme.lower() if scheme and scheme.isascii() else scheme
+    host = a.get("host") or None
+    host = host.lower() if host and host.isascii() else host
     port = a.get("port")
     mime = a.get("mimeType")
     spec = DataSpec(
         scheme=scheme if scheme and (scheme == "*" or SCHEME_RE.match(scheme)) else None,
         host=host if host and _valid_host(host) else None,
-        port=port if port and PORT_RE.match(port) else None,
+        port=port if port and PORT_RE.match(port) and 0 < int(port) < 65536 else None,
         path=_safe_path(a.get("path")),
         pathPrefix=_safe_path(a.get("pathPrefix")),
         pathPattern=_safe_path(a.get("pathPattern")),
@@ -382,7 +392,7 @@ def parse_manifest(text: str, label: str | None = None) -> ManifestInfo | None:
     if root.attrs.get("split"):
         return None
     package = root.attrs.get("package", "")
-    if not PACKAGE_RE.match(package):
+    if not package_ok(package):
         return None
     target_sdk = None
     for sdk in root.kids("uses-sdk"):
@@ -473,8 +483,9 @@ def dump_manifest(apk: Path, aapt2: str) -> str | None:
 
 def dump_label(apk: Path, aapt2: str) -> str | None:
     text = _run_aapt2(aapt2, "dump", "badging", str(apk))
-    if text and (m := re.search(r"^application-label:'([^'\n]*)'", text, re.M)):
-        return m.group(1)
+    # aapt2 escapes quotes and backslashes in the label with a backslash.
+    if text and (m := re.search(r"^application-label:'((?:[^'\\\n]|\\.)*)'", text, re.M)):
+        return re.sub(r"\\(.)", lambda e: {"n": " ", "t": " "}.get(e.group(1), e.group(1)), m.group(1))
     return None
 
 
@@ -524,7 +535,11 @@ def _link_rank(link: DeepLink) -> int:
 def _paths_note(paths: list[str]) -> str:
     if not paths:
         return ""
-    shown = ", ".join("/" + p.lstrip("/") if not p.startswith("*") else p for p in paths[:MAX_PATHS_IN_DESCRIPTION])
+    def show(p: str) -> str:
+        p = p if p.startswith("*") else "/" + p.lstrip("/")
+        return p if len(p) <= MAX_PATH_IN_DESCRIPTION else p[: MAX_PATH_IN_DESCRIPTION - 3] + "..."
+
+    shown = ", ".join(show(p) for p in paths[:MAX_PATHS_IN_DESCRIPTION])
     more = f" and {len(paths) - MAX_PATHS_IN_DESCRIPTION} more" if len(paths) > MAX_PATHS_IN_DESCRIPTION else ""
     return f" The app declares these paths: {shown}{more}."
 
@@ -533,13 +548,17 @@ def _link_tool(info: ManifestInfo, slug: str, app: str, link: DeepLink, single: 
     pkg = info.package
     cats = [CATEGORY_BROWSABLE]
     if link.scheme == "https" and not link.host:
+        # The scheme stays fixed so the argument cannot turn the intent into a
+        # javascript:, intent: or file: URI that a browser would act on.
         return {
             "name": prefixed_name(slug, "open_url"),
-            "description": f"Open a web address in {app}.",
+            "description": f"Open a web address in {app} over https.",
             "package": pkg,
             "inputSchema": {"type": "object", "properties": {
-                "url": {"type": "string", "description": "Full http or https URL."}}, "required": ["url"]},
-            "action": _intent(ACTION_VIEW, package=pkg, data="{url}", categories=cats),
+                "address": {"type": "string",
+                            "description": "Web address without the scheme, such as example.org/page?q=1."}},
+                "required": ["address"]},
+            "action": _intent(ACTION_VIEW, package=pkg, data="https://{address}", categories=cats),
         }
     if not link.host:
         return {
@@ -612,7 +631,7 @@ def _activity_tools(info: ManifestInfo, slug: str, app: str) -> tuple[dict | Non
         tool = {
             "name": prefixed_name(slug, "open", screen),
             "description": (f"Launch {app} on its main screen." if launch else
-                            f"Open the {act.simple_name} screen of {app}."),
+                            f"Open the {act.simple_name[:MAX_NAME_IN_DESCRIPTION]} screen of {app}."),
             "package": info.package,
             "inputSchema": {"type": "object", "properties": {}, "required": []},
             "action": _intent(action, package=info.package, component=f"{info.package}/{act.name}",
@@ -631,7 +650,8 @@ def _activity_tools(info: ManifestInfo, slug: str, app: str) -> tuple[dict | Non
 def generate_tools(info: ManifestInfo, slug: str | None = None, limit: int = TOOL_LIMIT) -> list[dict]:
     """Tools for one app, deep links first, capped at `limit`."""
     label = safe_label(info.label)
-    slug = slug or app_slug(info.package, label)
+    if not (isinstance(slug, str) and NAME_RE.match(slug) and len(slug) <= 20):
+        slug = app_slug(info.package, label)
     app = label or info.package
     links = sorted(info.deep_links(), key=_link_rank)
     single = sum(1 for l in links if l.host) == 1
@@ -649,6 +669,13 @@ def generate_tools(info: ManifestInfo, slug: str | None = None, limit: int = TOO
             suffix = f"_{n}"
             tool["name"] = base[: 64 - len(suffix)] + suffix
             n += 1
+        if len(tool["description"]) > MAX_DESCRIPTION:
+            tool["description"] = tool["description"][: MAX_DESCRIPTION - 3] + "..."
+        try:
+            validate_tool(tool, info.package)
+        except ToolError as e:
+            log.warning("dropping generated tool: %s", e)
+            continue
         names.add(tool["name"])
         out.append(tool)
     return out

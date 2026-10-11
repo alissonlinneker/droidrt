@@ -8,11 +8,14 @@ virtual display. Installing an APK/XAPK/APKS also creates a launcher .app.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import plistlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -43,12 +46,19 @@ STORE_PACKAGE = "com.android.vending"
 APPS_DIR = Path(os.environ.get("DROIDRT_APPS_DIR", HOME / "Applications/Android"))
 STATE_DIR = HOME / "Library/Application Support/droidrt"
 LOG_DIR = HOME / "Library/Logs/droidrt"
+LOCK_DIR = STATE_DIR / "locks"
+# Marker touched whenever a window closes; idle-stop leaves the VM alone if a newer one exists.
+LAST_CLOSE = STATE_DIR / "last-window-close"
 DISPLAY = os.environ.get("DROIDRT_DISPLAY", "720x1560/320")
 # Opt-in resizable windows (scrcpy --flex-display). Off by default: see flex_display_spec().
 RESIZABLE = os.environ.get("DROIDRT_RESIZABLE", "0") == "1"
 IDLE_GRACE = int(os.environ.get("DROIDRT_IDLE_GRACE", "120"))
 MAX_FPS = os.environ.get("DROIDRT_MAX_FPS", "30")
 BOOT_TIMEOUT = 240
+# Default for any external command; long operations pass their own timeout.
+CMD_TIMEOUT = 120
+# Android package names: dot separated segments of letters, digits and underscores.
+PACKAGE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)*")
 
 # Finder-launched bundles get a minimal PATH, so tools are resolved explicitly.
 TOOL_PATH = os.pathsep.join(
@@ -76,6 +86,10 @@ class DroidError(Exception):
     pass
 
 
+class Interrupted(DroidError):
+    """SIGTERM arrived while `launch` had no window to forward it to."""
+
+
 def tool(name: str) -> str:
     path = shutil.which(name, path=TOOL_PATH)
     if not path:
@@ -83,20 +97,72 @@ def tool(name: str) -> str:
     return path
 
 
-def run(*args: str, check: bool = True, timeout: float | None = None) -> str:
-    proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+def run(*args: str, check: bool = True, timeout: float = CMD_TIMEOUT) -> str:
+    """Run a command without a shell; a hang or a missing binary becomes a DroidError."""
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL, errors="replace")
+    except subprocess.TimeoutExpired:
+        raise DroidError(f"{' '.join(args)} timed out after {timeout:.0f}s") from None
+    except OSError as e:
+        raise DroidError(f"{args[0]}: {e.strerror or e}") from None
     if check and proc.returncode != 0:
         raise DroidError(f"{' '.join(args)} failed: {(proc.stderr or proc.stdout).strip()}")
     return proc.stdout
 
 
-def adb(*args: str, check: bool = True, timeout: float | None = None) -> str:
+def adb(*args: str, check: bool = True, timeout: float = CMD_TIMEOUT) -> str:
     return run(tool("adb"), "-s", SERIAL, *args, check=check, timeout=timeout)
 
 
 def pgrep(pattern: str) -> list[int]:
-    out = run("/usr/bin/pgrep", "-f", pattern, check=False)
-    return [int(p) for p in out.split()]
+    out = run("/usr/bin/pgrep", "-f", pattern, check=False, timeout=10)
+    return [int(p) for p in out.split() if p.isdigit()]
+
+
+def check_package(package: str) -> str:
+    """Package names end up in adb shell commands, file names and bundle ids: accept only valid ones."""
+    if not isinstance(package, str) or len(package) > 255 or not PACKAGE_RE.fullmatch(package):
+        raise DroidError(f"invalid package name: {package!r}")
+    return package
+
+
+# ---------------------------------------------------------------- locks
+
+def acquire_lock(name: str, shared: bool = False, timeout: float = 0) -> int | None:
+    """flock() a file in LOCK_DIR; returns the descriptor, or None if still busy after `timeout`.
+
+    The kernel drops the lock when the process dies, so a crash never leaves it stale.
+    """
+    for d in (LOCK_DIR.parent, LOCK_DIR):
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(LOCK_DIR / name, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(0.2)
+
+
+def release_lock(fd: int | None) -> None:
+    if fd is not None:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def locked(name: str, shared: bool = False, timeout: float = CMD_TIMEOUT):
+    fd = acquire_lock(name, shared, timeout)
+    if fd is None:
+        raise DroidError(f"timed out waiting for another droidrt command ({name})")
+    try:
+        yield
+    finally:
+        release_lock(fd)
 
 
 def log(msg: str) -> None:
@@ -120,24 +186,30 @@ def avd_image(config: Path) -> str | None:
 
 
 def setup() -> None:
+    """Create or update the AVD. Callers hold vm.lock (see start() and main())."""
     avd_dir = AVD_HOME / f"{AVD}.avd"
     current = avd_image(avd_dir / "config.ini")
+    image_dir = SDK / Path(*IMAGE.split(";"))
+    if current and current != IMAGE and vm_pids():
+        raise DroidError("the VM is running; run 'droidrt stop' before changing the image")
+    if (current != IMAGE or not avd_dir.exists()) and not image_dir.exists():
+        # Download first: a failed download must not cost the existing AVD and its apps.
+        log(f"downloading {IMAGE}")
+        run(tool("sdkmanager"), f"--sdk_root={SDK}", IMAGE, timeout=3600)
     if current and current != IMAGE:
-        if vm_pids():
-            raise DroidError("the VM is running; run 'droidrt stop' before changing the image")
         log(f"image changed ({current} to {IMAGE}): recreating the AVD, installed apps will be lost")
         shutil.rmtree(avd_dir)
         (AVD_HOME / f"{AVD}.ini").unlink(missing_ok=True)
     if not avd_dir.exists():
         log(f"creating AVD '{AVD}' ({IMAGE})")
-        image_dir = SDK / Path(*IMAGE.split(";"))
-        if not image_dir.exists():
-            run(tool("sdkmanager"), f"--sdk_root={SDK}", IMAGE)
         # avdmanager prints a devices.xml warning on Homebrew SDKs but still creates the AVD.
-        subprocess.run(
-            [tool("avdmanager"), "create", "avd", "-n", AVD, "-k", IMAGE, "-d", "pixel_6", "--force"],
-            input="no\n", capture_output=True, text=True,
-        )
+        try:
+            subprocess.run(
+                [tool("avdmanager"), "create", "avd", "-n", AVD, "-k", IMAGE, "-d", "pixel_6", "--force"],
+                input="no\n", capture_output=True, text=True, timeout=CMD_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            raise DroidError("avdmanager timed out") from None
         if not avd_dir.exists():
             raise DroidError("avdmanager did not create the AVD")
     apply_avd_settings(avd_dir / "config.ini", AVD_SETTINGS)
@@ -146,7 +218,7 @@ def setup() -> None:
 def is_booted() -> bool:
     try:
         return adb("shell", "getprop", "sys.boot_completed", check=False, timeout=5).strip() == "1"
-    except subprocess.TimeoutExpired:
+    except DroidError:  # adb hung (server starting, device offline) or is missing
         return False
 
 
@@ -171,71 +243,123 @@ def pick_webcam() -> str:
     wanted = os.environ.get("DROIDRT_CAMERA", "")
     if re.fullmatch(r"webcam\d+|none|emulated", wanted):
         return wanted
-    cams = parse_webcams(
-        run(tool("emulator"), "-webcam-list", check=False, timeout=60),
-        run("/usr/sbin/system_profiler", "SPCameraDataType", check=False, timeout=60),
-    )
+    try:
+        cams = parse_webcams(
+            run(tool("emulator"), "-webcam-list", check=False, timeout=60),
+            run("/usr/sbin/system_profiler", "SPCameraDataType", check=False, timeout=60),
+        )
+    except DroidError as e:  # a camera probe must never keep the VM from starting
+        log(f"camera detection failed ({e}), using the emulated camera")
+        return "emulated"
     for pattern in [wanted] if wanted else ["FaceTime", "Built-in", "Integrada"]:
         for wid, name in cams:
             if pattern.lower() in name.lower():
                 return wid
+    if wanted:
+        log(f"no camera matches DROIDRT_CAMERA={wanted!r}")
     return cams[0][0] if cams else "emulated"
 
 
 def start() -> None:
     if is_booted():
         return
-    setup()
-    if not vm_pids():
-        LOG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-        camera = pick_webcam()
-        log(f"starting headless VM (back camera: {camera})")
-        with open(LOG_DIR / "vm.log", "ab") as out:
-            subprocess.Popen(
-                [tool("emulator"), "-avd", AVD, "-port", str(PORT), "-no-window",
-                 *([] if AUDIO else ["-no-audio"]), *(["-allow-host-audio"] if AUDIO and MIC else []),
-                 "-no-boot-anim", "-no-snapshot-save", "-gpu", GPU,
-                 "-camera-back", camera, "-camera-front", "none"],
-                stdout=out, stderr=out, stdin=subprocess.DEVNULL, start_new_session=True,
-            )
-    t0 = time.monotonic()
-    run(tool("adb"), "-s", SERIAL, "wait-for-device", timeout=BOOT_TIMEOUT)
-    while not is_booted():
-        if time.monotonic() - t0 > BOOT_TIMEOUT:
-            raise DroidError(f"VM did not finish booting in {BOOT_TIMEOUT}s (see ~/Library/Logs/droidrt/vm.log)")
-        time.sleep(1)
-    log(f"VM ready in {time.monotonic() - t0:.0f}s")
+    # vm.lock serializes boots: without it two launches with the VM stopped both see no
+    # qemu process (the emulator takes a moment to exec it) and both spawn one.
+    with locked("vm.lock", timeout=BOOT_TIMEOUT + 60):
+        if is_booted():  # booted by whoever held the lock
+            return
+        setup()
+        emulator = None
+        if not vm_pids():
+            LOG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+            camera = pick_webcam()
+            log(f"starting headless VM (back camera: {camera})")
+            with open(LOG_DIR / "vm.log", "ab") as out:
+                emulator = subprocess.Popen(
+                    [tool("emulator"), "-avd", AVD, "-port", str(PORT), "-no-window",
+                     *([] if AUDIO else ["-no-audio"]), *(["-allow-host-audio"] if AUDIO and MIC else []),
+                     "-no-boot-anim", "-no-snapshot-save", "-gpu", GPU,
+                     "-camera-back", camera, "-camera-front", "none"],
+                    stdout=out, stderr=out, stdin=subprocess.DEVNULL, start_new_session=True,
+                )
+        t0 = time.monotonic()
+        while not is_booted():
+            if emulator is not None and emulator.poll() is not None and not vm_pids():
+                raise DroidError(f"the emulator exited with status {emulator.returncode} "
+                                 "(see ~/Library/Logs/droidrt/vm.log)")
+            if time.monotonic() - t0 > BOOT_TIMEOUT:
+                raise DroidError(f"VM did not finish booting in {BOOT_TIMEOUT}s (see ~/Library/Logs/droidrt/vm.log)")
+            time.sleep(1)
+        log(f"VM ready in {time.monotonic() - t0:.0f}s")
 
 
 def stop() -> None:
     if not vm_pids():
         return
-    adb("emu", "kill", check=False, timeout=10)
+    try:
+        adb("emu", "kill", check=False, timeout=10)
+    except DroidError as e:  # console unresponsive: fall through to SIGTERM
+        log(f"emu kill failed: {e}")
     for _ in range(20):
         if not vm_pids():
             return
         time.sleep(0.5)
     for pid in vm_pids():
-        os.kill(pid, 15)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
 
 
 def window_pids() -> list[int]:
     return pgrep(f"scrcpy.*-s {SERIAL}")
 
 
+def last_window_close() -> float:
+    try:
+        return LAST_CLOSE.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def idle_stop(grace: int) -> None:
-    """Stop the VM once no app window has been open for `grace` seconds."""
+    """Stop the VM once no app window has been open for `grace` seconds.
+
+    Checking for windows and stopping happen while holding busy.lock exclusively and
+    vm.lock: a launch holds busy.lock shared from before booting until its window
+    closes, so a launch that is booting or opening a window can never be cut off.
+    """
+    began = time.time()
     time.sleep(grace)
-    if not window_pids():
-        log("no open windows, stopping the VM")
-        stop()
+    if last_window_close() > began:
+        return  # a window closed after this countdown began; its own idle-stop decides
+    busy = acquire_lock("busy.lock")
+    if busy is None:
+        return  # a launch is booting the VM or showing a window
+    try:
+        vm = acquire_lock("vm.lock")
+        if vm is None:
+            return  # someone is booting the VM
+        try:
+            if window_pids():
+                return
+            log("no open windows, stopping the VM")
+            stop()
+        finally:
+            release_lock(vm)
+    finally:
+        release_lock(busy)
 
 
 # ---------------------------------------------------------------- packages
 
 def collect_apks(src: Path, workdir: Path) -> tuple[list[Path], dict, Path | None]:
     """Return (apk files, xapk manifest or {}, bundled icon) for .apk/.xapk/.apks/.apkm."""
+    if not src.is_file():
+        raise DroidError(f"{src} does not exist or is not a file")
     if src.suffix.lower() == ".apk":
+        if not zipfile.is_zipfile(src):
+            raise DroidError(f"{src} is not a valid APK")
         return [src], {}, None
     if not zipfile.is_zipfile(src):
         hint = " (legacy .apkm files are encrypted; download the current format or convert it with unapkm)" if src.suffix.lower() == ".apkm" else ""
@@ -270,6 +394,8 @@ def collect_apks(src: Path, workdir: Path) -> tuple[list[Path], dict, Path | Non
     apks = [a for a in apks if not is_foreign_abi_split(a.name)]
     if not apks:
         raise DroidError("no APK inside the package")
+    if bad := [a.name for a in apks if not zipfile.is_zipfile(a)]:
+        raise DroidError(f"corrupt APK inside the package: {', '.join(bad)}")
     icon = inside(workdir, manifest["icon"]) if isinstance(manifest.get("icon"), str) else None
     return apks, manifest, icon if icon and icon.is_file() else None
 
@@ -337,17 +463,22 @@ def apk_info(apk: Path, manifest: dict) -> dict:
     info = {}
     if a := aapt2():
         info = parse_badging(run(a, "dump", "badging", str(apk), check=False))
+    # manifest.json is untrusted metadata, used only when aapt2 is missing or silent.
     info.setdefault("package", manifest.get("package_name"))
     info.setdefault("label", manifest.get("name") or info.get("package"))
     info.setdefault("version", manifest.get("version_name", ""))
     if not info["package"]:
         raise DroidError(f"could not read the package name of {apk}")
+    check_package(info["package"])
+    info["label"] = info["label"] if isinstance(info["label"], str) else info["package"]
+    info["version"] = info["version"] if isinstance(info["version"], str) else ""
     return info
 
 
 def render_icon(apks: list[Path], workdir: Path) -> Path | None:
     """Adaptive/vector icon through iconkit, falling back to the raster lookup."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "iconkit"))
+    entry = str(Path(__file__).resolve().parent / "iconkit")
+    sys.path.insert(0, entry)
     try:
         import iconkit
         out = workdir / "icon-rendered.png"
@@ -356,8 +487,13 @@ def render_icon(apks: list[Path], workdir: Path) -> Path | None:
     except Exception as e:  # iconkit is best effort; a missing icon must not block installs
         log(f"iconkit failed: {e}")
     finally:
-        sys.path.pop(0)
-    return find_icon_png(apks, workdir)
+        with contextlib.suppress(ValueError):
+            sys.path.remove(entry)
+    try:
+        return find_icon_png(apks, workdir)
+    except (OSError, zipfile.BadZipFile) as e:
+        log(f"icon lookup failed: {e}")
+        return None
 
 
 def find_icon_png(apks: list[Path], workdir: Path) -> Path | None:
@@ -387,15 +523,21 @@ def clean_label(label: str) -> str:
 
 
 def safe_name(label: str) -> str:
-    return re.sub(r'[/:\\"]', "-", clean_label(label)).strip(" .") or "Android App"
+    name = re.sub(r'[/:\\"]', "-", clean_label(label)).strip(" .")
+    # 80 characters can be 320 UTF-8 bytes; keep room under the 255 byte file name limit.
+    while len(name.encode()) > 120:
+        name = name[:-1]
+    return name.rstrip(" .") or "Android App"
 
 
 def icon_dimensions_ok(png: Path) -> bool:
     """Check the declared size before any decoder allocates the bitmap."""
     if png.stat().st_size > MAX_ICON_BYTES:
         return False
-    out = subprocess.run(["sips", "-g", "pixelWidth", "-g", "pixelHeight", str(png)],
-                         capture_output=True, text=True, timeout=30).stdout
+    try:
+        out = run("/usr/bin/sips", "-g", "pixelWidth", "-g", "pixelHeight", str(png), check=False, timeout=30)
+    except DroidError:
+        return False
     dims = [int(v) for v in re.findall(r"pixel(?:Width|Height): (\d+)", out)]
     return len(dims) == 2 and all(0 < d <= MAX_ICON_PIXELS for d in dims)
 
@@ -419,7 +561,8 @@ def info_plist(label: str, package: str, version: str) -> dict:
     return {
         "CFBundleName": label,
         "CFBundleDisplayName": label,
-        "CFBundleIdentifier": f"local.droidrt.{package}",
+        # Bundle ids allow letters, digits, hyphens and periods; package names may have underscores.
+        "CFBundleIdentifier": "local.droidrt." + package.replace("_", "-"),
         "CFBundleVersion": short_version(version),
         "CFBundleShortVersionString": short_version(version),
         "CFBundlePackageType": "APPL",
@@ -430,6 +573,8 @@ def info_plist(label: str, package: str, version: str) -> dict:
         "NSCameraUsageDescription": f"{label} uses the camera through Android.",
         "NSMicrophoneUsageDescription": f"{label} uses the microphone through Android.",
         "DroidrtPackage": package,
+        # The full version; CFBundleShortVersionString drops suffixes and cannot tell builds apart.
+        "DroidrtVersion": version,
     }
 
 
@@ -438,101 +583,190 @@ def make_icns(png: Path, dest: Path) -> bool:
         iconset = Path(tmp) / "icon.iconset"
         iconset.mkdir()
         src = Path(tmp) / "src.png"
-        if subprocess.run(["sips", "-s", "format", "png", str(png), "--out", str(src)], capture_output=True).returncode:
+        try:
+            run("/usr/bin/sips", "-s", "format", "png", str(png), "--out", str(src), timeout=60)
+            for size in (16, 32, 128, 256, 512):
+                for scale in (1, 2):
+                    px = size * scale
+                    suffix = "" if scale == 1 else "@2x"
+                    run("/usr/bin/sips", "-z", str(px), str(px), str(src), "--out",
+                        str(iconset / f"icon_{size}x{size}{suffix}.png"), check=False, timeout=60)
+            run("/usr/bin/iconutil", "-c", "icns", str(iconset), "-o", str(dest), timeout=60)
+        except DroidError as e:  # the bundle keeps the generic icon
+            log(f"icon conversion failed: {e}")
             return False
-        for size in (16, 32, 128, 256, 512):
-            for scale in (1, 2):
-                px = size * scale
-                suffix = "" if scale == 1 else "@2x"
-                subprocess.run(["sips", "-z", str(px), str(px), str(src), "--out",
-                                str(iconset / f"icon_{size}x{size}{suffix}.png")], capture_output=True)
-        return subprocess.run(["iconutil", "-c", "icns", str(iconset), "-o", str(dest)],
-                              capture_output=True).returncode == 0
+        return True
+
+
+def bundle_package(app: Path) -> str | None:
+    """DroidrtPackage of a launcher bundle, or None for anything droidrt did not create."""
+    if app.is_symlink():
+        return None
+    try:
+        with open(app / "Contents/Info.plist", "rb") as f:
+            pl = plistlib.load(f)
+    except Exception:  # OSError, InvalidFileException, ExpatError, ...: not one of ours
+        return None
+    pkg = pl.get("DroidrtPackage") if isinstance(pl, dict) else None
+    return pkg if isinstance(pkg, str) else None
 
 
 def launcher_path(label: str, package: str) -> Path:
-    """Bundle path for a package; a label already taken by another package gets the package appended."""
-    app = APPS_DIR / f"{safe_name(label)}.app"
-    owner = launchers_by_path().get(app)
-    if owner and owner != package:
-        app = APPS_DIR / f"{safe_name(label)} ({package}).app"
-    return app
+    """Bundle path for a package. A name taken by anything else (another package's launcher
+    or an unrelated app) is never reused: the package, then a counter, is appended."""
+    base = safe_name(label)
+    names = [f"{base}.app", f"{base} ({package}).app", *(f"{base} ({package}) {n}.app" for n in range(2, 100))]
+    for name in names:
+        app = APPS_DIR / name
+        # exists() follows the case-insensitive file system: "whatsapp.app" blocks "WhatsApp.app".
+        if (not app.exists() and not app.is_symlink()) or bundle_package(app) == package:
+            return app
+    raise DroidError(f"no free launcher name for {package} in {APPS_DIR}")
 
 
-def launchers_by_path() -> dict[Path, str]:
-    return {app: pkg for pkg, (app, _) in launchers().items()}
+def remove_bundle(app: Path) -> None:
+    try:
+        if app.is_symlink():
+            app.unlink()
+        else:
+            shutil.rmtree(app)
+    except FileNotFoundError:
+        pass
 
 
 def create_launcher(info: dict, icon: Path | None) -> Path:
-    info = {**info, "label": clean_label(info["label"]) or info["package"]}
+    """Build the bundle in a staging directory and swap it in, so a failure halfway
+    (launcher build, disk full) leaves the previous launcher untouched.
+    Callers hold launchers.lock."""
+    package = check_package(info["package"])
+    label = clean_label(info["label"]) or package
     APPS_DIR.mkdir(parents=True, exist_ok=True)
-    app = launcher_path(info["label"], info["package"])
-    for old_pkg, (old_app, _) in launchers().items():
-        if old_pkg == info["package"] and old_app != app:
-            shutil.rmtree(old_app)
-    if app.exists():
-        shutil.rmtree(app)
-    macos = app / "Contents/MacOS"
-    res = app / "Contents/Resources"
-    macos.mkdir(parents=True)
-    res.mkdir(parents=True)
-    with open(app / "Contents/Info.plist", "wb") as f:
-        plistlib.dump(info_plist(info["label"], info["package"], info.get("version", "")), f)
-    shutil.copy2(launcher_binary(), macos / "droidrt-launcher")
-    if icon and icon_dimensions_ok(icon):
-        make_icns(icon, res / "icon.icns")
-    subprocess.run(["xattr", "-cr", str(app)], capture_output=True)
+    binary = launcher_binary()
+    staging = Path(tempfile.mkdtemp(prefix=".droidrt-", dir=APPS_DIR))
+    try:
+        staging.chmod(0o755)
+        macos = staging / "Contents/MacOS"
+        res = staging / "Contents/Resources"
+        macos.mkdir(parents=True)
+        res.mkdir(parents=True)
+        with open(staging / "Contents/Info.plist", "wb") as f:
+            plistlib.dump(info_plist(label, package, info.get("version", "")), f)
+        shutil.copy2(binary, macos / "droidrt-launcher")
+        if icon and icon_dimensions_ok(icon):
+            make_icns(icon, res / "icon.icns")
+        run("/usr/bin/xattr", "-cr", str(staging), check=False, timeout=60)
+        app = launcher_path(label, package)
+        for old in launcher_bundles():
+            if old[1].get("DroidrtPackage") == package:
+                remove_bundle(old[0])
+        os.rename(staging, app)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     return app
 
 
 # ---------------------------------------------------------------- commands
 
 def install(src: Path, launcher: bool = True) -> dict:
-    start()
     with tempfile.TemporaryDirectory(prefix="droidrt-") as tmp:
         work = Path(tmp)
+        # Validate the package before booting the VM for it.
         apks, manifest, icon = collect_apks(src, work)
         check_abi(apks)
         info = apk_info(base_apk(apks), manifest)
+        start()
         log(f"installing {info['label']} ({info['package']} {info['version']}), {len(apks)} APK(s)")
         cmd = ["install-multiple", "-r", "-g"] if len(apks) > 1 else ["install", "-r", "-g"]
         out = adb(*cmd, *map(str, apks), timeout=600)
         if "Success" not in out:
             raise DroidError(f"install failed: {out.strip()}")
         if launcher:
-            app = create_launcher(info, icon or render_icon(apks, work))
+            icon = icon or render_icon(apks, work)
+            with locked("launchers.lock"):
+                app = create_launcher(info, icon)
             info["app"] = str(app)
             log(f"launcher created: {app}")
     return info
 
 
+def spawn_idle_stop() -> None:
+    try:
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "idle-stop"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError as e:
+        log(f"could not schedule the idle VM shutdown: {e}")
+
+
 def launch(package: str, title: str | None) -> int:
-    if pgrep(f"scrcpy.*-s {SERIAL}.*--start-app={re.escape(package)}( |$)"):
+    check_package(package)
+    # One launch per package: a second one (double click, launcher plus MCP) while the
+    # first is still booting would otherwise open a second window for the same app.
+    own = acquire_lock(f"launch-{package}.lock")
+    if own is None or pgrep(f"scrcpy.*-s {SERIAL}.*--start-app={re.escape(package)}( |$)"):
+        release_lock(own)
         log(f"{package} is already open")
         return 0
-    start()
-    if not adb("shell", "pm", "path", package, check=False).strip():
-        raise DroidError(f"{package} is not installed (use: droidrt install <file>)")
-    LOG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    # scrcpy sometimes loses the race with its device server ("Server connection failed")
-    # and exits within seconds; a quick failure is retried, a normal window close is not.
-    for attempt in range(3):
-        t0 = time.monotonic()
-        code = run_window(package, title)
-        if code == 0 or time.monotonic() - t0 > 8:
-            break
-        log(f"window failed to open (attempt {attempt + 1}), retrying")
-        time.sleep(1)
-    if package == STORE_PACKAGE:
-        # Apps installed from the Play Store get their launchers when the store closes.
-        try:
-            sync()
-        except DroidError as e:
-            log(f"sync failed: {e}")
-    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "idle-stop"],
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
-    return code
+    # The launcher stops a window with SIGTERM. Forward it to scrcpy while a window is up,
+    # otherwise abort (boot, retry pause): either way the idle shutdown below still runs.
+    # Raising is only safe inside the try block below ("abortable") and never between
+    # spawning scrcpy and recording it ("spawning"), or the window would be orphaned.
+    state = {"stopping": False, "spawning": False, "abortable": False, "window": None}
+
+    def on_term(signum, frame):
+        state["stopping"] = True
+        window = state["window"]
+        if window is not None and window.poll() is None:
+            window.terminate()
+        elif state["abortable"] and not state["spawning"]:
+            raise Interrupted("stopped by signal")
+
+    previous = signal.signal(signal.SIGTERM, on_term)
+    busy = None
+    code = 1
+    try:
+        state["abortable"] = True
+        # busy.lock (shared) tells idle-stop that a launch is in flight; see idle_stop().
+        busy = acquire_lock("busy.lock", shared=True, timeout=60)
+        if busy is None:
+            raise DroidError("timed out waiting for the VM to stop")
+        start()
+        if not adb("shell", "pm", "path", package, check=False, timeout=30).strip():
+            raise DroidError(f"{package} is not installed (use: droidrt install <file>)")
+        LOG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # scrcpy sometimes loses the race with its device server ("Server connection failed")
+        # and exits within seconds with status 1; such a quick failure is retried. A window
+        # closed by the user (0) or stopped by a signal (negative status) is not.
+        for attempt in range(3):
+            t0 = time.monotonic()
+            code = run_window(package, title, state)
+            if state["stopping"] or code <= 0 or time.monotonic() - t0 > 8 or attempt == 2:
+                break
+            log(f"window failed to open (attempt {attempt + 1}), retrying")
+            time.sleep(1)
+        # The window is gone: a new launch of this package may proceed during the sync below.
+        release_lock(own)
+        own = None
+        if package == STORE_PACKAGE and not state["stopping"]:
+            # Apps installed from the Play Store get their launchers when the store closes.
+            try:
+                sync()
+            except Interrupted:
+                raise
+            except DroidError as e:
+                log(f"sync failed: {e}")
+        state["abortable"] = False
+        return code
+    finally:
+        state["abortable"] = False
+        signal.signal(signal.SIGTERM, previous)
+        with contextlib.suppress(OSError):
+            LAST_CLOSE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            LAST_CLOSE.touch()
+        release_lock(busy)
+        release_lock(own)
+        spawn_idle_stop()
 
 
 def flex_display_spec(spec: str) -> str:
@@ -563,23 +797,41 @@ def window_command(package: str, title: str | None, resizable: bool = RESIZABLE)
             "--stay-awake", f"--max-fps={MAX_FPS}"]
 
 
-def run_window(package: str, title: str | None) -> int:
+def run_window(package: str, title: str | None, state: dict | None = None) -> int:
+    """Run scrcpy until the window closes. `state` lets launch()'s SIGTERM handler reach it."""
+    state = state if state is not None else {"stopping": False, "spawning": False, "window": None}
     with open(LOG_DIR / f"{package}.log", "ab") as out:
-        return subprocess.call(window_command(package, title), stdout=out, stderr=out)
+        state["spawning"] = True
+        try:
+            window = subprocess.Popen(window_command(package, title), stdin=subprocess.DEVNULL, stdout=out, stderr=out)
+            state["window"] = window
+        finally:
+            state["spawning"] = False
+        try:
+            if state["stopping"]:  # SIGTERM arrived while scrcpy was being spawned
+                window.terminate()
+            return window.wait()
+        finally:
+            state["window"] = None
 
 
-def launchers() -> dict[str, tuple[Path, dict]]:
-    """Installed launcher bundles keyed by Android package."""
-    found = {}
+def launcher_bundles() -> list[tuple[Path, dict]]:
+    """Every launcher bundle in APPS_DIR with its Info.plist; unreadable bundles are skipped."""
+    found = []
     for app in sorted(APPS_DIR.glob("*.app")):
         try:
             with open(app / "Contents/Info.plist", "rb") as f:
                 pl = plistlib.load(f)
-        except (OSError, plistlib.InvalidFileException):
+        except Exception:  # OSError, InvalidFileException, ExpatError: not a usable launcher
             continue
-        if pkg := pl.get("DroidrtPackage"):
-            found[pkg] = (app, pl)
+        if isinstance(pl, dict) and isinstance(pl.get("DroidrtPackage"), str):
+            found.append((app, pl))
     return found
+
+
+def launchers() -> dict[str, tuple[Path, dict]]:
+    """Installed launcher bundles keyed by Android package."""
+    return {pl["DroidrtPackage"]: (app, pl) for app, pl in launcher_bundles()}
 
 
 def list_apps() -> None:
@@ -617,32 +869,50 @@ def pull_apks(package: str, workdir: Path) -> list[Path]:
     return apks
 
 
+def launcher_is_current(pl: dict, version: str) -> bool:
+    """Compare the full version; bundles from older releases only kept the short one."""
+    built = pl.get("DroidrtVersion")
+    if isinstance(built, str):
+        return built == version
+    return pl.get("CFBundleShortVersionString") == short_version(version)
+
+
+def is_installed(package: str) -> bool:
+    return bool(adb("shell", "pm", "path", package, check=False, timeout=30).strip())
+
+
 def sync() -> list[str]:
     """Create launchers for apps installed inside the VM and drop stale ones."""
     start()
-    installed = launchable_user_packages()
-    existing = launchers()
-    created = []
-    for pkg in installed:
-        version = parse_version(adb("shell", "dumpsys", "package", pkg, check=False))
-        if pkg in existing and existing[pkg][1].get("CFBundleShortVersionString") == short_version(version):
-            continue
-        with tempfile.TemporaryDirectory(prefix="droidrt-") as tmp:
-            work = Path(tmp)
-            apks = pull_apks(pkg, work)
-            if not apks:
+    with locked("launchers.lock", timeout=600):
+        installed = launchable_user_packages()
+        existing = launchers()
+        created = []
+        for pkg in installed:
+            version = parse_version(adb("shell", "dumpsys", "package", pkg, check=False))
+            if pkg in existing and launcher_is_current(existing[pkg][1], version):
                 continue
-            info = apk_info(base_apk(apks), {"package_name": pkg, "version_name": version})
-            info["package"], info["version"] = pkg, version
-            if pkg in existing:
-                shutil.rmtree(existing[pkg][0])
-            app = create_launcher(info, render_icon(apks, work))
-            created.append(str(app))
-            log(f"launcher created: {app}")
-    for pkg, (app, _) in existing.items():
-        if pkg not in installed:
-            shutil.rmtree(app)
-            log(f"removed {app} ({pkg} is no longer installed)")
+            with tempfile.TemporaryDirectory(prefix="droidrt-") as tmp:
+                work = Path(tmp)
+                try:
+                    apks = pull_apks(pkg, work)
+                    if not apks:
+                        continue
+                    info = apk_info(base_apk(apks), {"package_name": pkg, "version_name": version})
+                    info["package"], info["version"] = pkg, version
+                    # create_launcher replaces the old bundle only once the new one is ready.
+                    app = create_launcher(info, render_icon(apks, work))
+                except (DroidError, zipfile.BadZipFile) as e:  # one bad app must not stop the others
+                    log(f"skipped {pkg}: {e}")
+                    continue
+                created.append(str(app))
+                log(f"launcher created: {app}")
+        for pkg, (app, _) in existing.items():
+            # The listing above can come back short (package manager still settling, apps
+            # without a launcher activity): only drop a launcher whose package is really gone.
+            if pkg not in installed and not is_installed(pkg):
+                remove_bundle(app)
+                log(f"removed {app} ({pkg} is no longer installed)")
     return created
 
 
@@ -658,11 +928,16 @@ def set_location(lat: float, lon: float) -> None:
 
 
 def uninstall(package: str) -> None:
+    check_package(package)
     start()
-    adb("uninstall", package, check=False)
-    if package in (found := launchers()):
-        shutil.rmtree(found[package][0])
-        log(f"removed {found[package][0]}")
+    out = adb("uninstall", package, check=False, timeout=CMD_TIMEOUT)
+    if "Success" not in out and is_installed(package):
+        raise DroidError(f"uninstall failed: {out.strip() or 'unknown error'}")
+    with locked("launchers.lock"):
+        for app, pl in launcher_bundles():
+            if pl["DroidrtPackage"] == package:
+                remove_bundle(app)
+                log(f"removed {app}")
 
 
 def status() -> None:
@@ -700,7 +975,9 @@ def main(argv: list[str] | None = None) -> int:
     a = p.parse_args(argv)
     try:
         match a.cmd:
-            case "setup": setup()
+            case "setup":
+                with locked("vm.lock", timeout=BOOT_TIMEOUT + 60):
+                    setup()
             case "start": start()
             case "stop": stop()
             case "status": status()
@@ -720,6 +997,11 @@ def main(argv: list[str] | None = None) -> int:
     except DroidError as e:
         log(f"error: {e}")
         return 1
+    except (OSError, zipfile.BadZipFile) as e:  # unreadable files, full disk: a message, not a traceback
+        log(f"error: {e}")
+        return 1
+    except KeyboardInterrupt:
+        return 130
     return 0
 
 

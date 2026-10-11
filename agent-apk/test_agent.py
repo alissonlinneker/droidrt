@@ -21,6 +21,7 @@ import json
 import os
 import re
 import secrets
+import select
 import shutil
 import socket
 import subprocess
@@ -35,6 +36,7 @@ NODE_ID = re.compile(r"^w-?\d+:0(\.\d+)*$")
 SET_KEY = ["shell", "am", "broadcast", "-a", "dev.droidrt.agent.SET_KEY",
            "-n", "dev.droidrt.agent/.KeyReceiver", "--es", "key"]
 HANDSHAKE_TIMEOUT_S = 10
+MAX_PENDING_HANDSHAKES = 8
 
 failures = []
 
@@ -245,16 +247,84 @@ def auth_checks(adb, port, key, key_hex):
           data == b"" and HANDSHAKE_TIMEOUT_S - 1 <= elapsed <= HANDSHAKE_TIMEOUT_S + 4,
           f"{elapsed:.1f}s")
 
-    # An oversized first line is cut off.
+    # A client dribbling one byte per second cannot stretch the handshake:
+    # the deadline counts from the accept, not from the last byte.
+    sock, f, _ = raw_connection(port)
+    start = time.monotonic()
+    closed = False
+    while time.monotonic() - start < HANDSHAKE_TIMEOUT_S + 10:
+        try:
+            sock.sendall(b"{" if not closed and time.monotonic() - start < 0.5 else b" ")
+        except OSError:
+            closed = True
+            break
+        readable, _, _ = select.select([sock], [], [], 1.0)
+        if readable:
+            try:
+                closed = sock.recv(4096) == b""
+            except OSError:
+                closed = True
+            if closed:
+                break
+    elapsed = time.monotonic() - start
+    sock.close()
+    check("dribbling client is closed by the handshake deadline",
+          closed and elapsed <= HANDSHAKE_TIMEOUT_S + 4, f"{elapsed:.1f}s")
+
+    # An oversized first line is cut off long before the 1 MiB request limit.
     sock, f, _ = raw_connection(port)
     try:
-        f.write(b"{" + b"a" * (1024 * 1024 + 16))
+        f.write(b"{" + b"a" * 8192)
         f.flush()
     except (BrokenPipeError, ConnectionResetError):
         pass
+    start = time.monotonic()
     data = rest_of_stream(f)
+    elapsed = time.monotonic() - start
     sock.close()
-    check("line over 1 MiB closes the connection", data == b"", repr(data[:80]))
+    check("oversized auth line closes the connection at once",
+          data == b"" and elapsed < HANDSHAKE_TIMEOUT_S - 2, f"{elapsed:.1f}s")
+
+    # After auth, a request line over 1 MiB closes the connection.
+    try:
+        a = Agent(port, key)
+        try:
+            a.file.write(b"{" + b"a" * (1024 * 1024 + 16))
+            a.file.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        data = rest_of_stream(a.file)
+        a.close()
+        check("request line over 1 MiB closes the connection", data == b"", repr(data[:80]))
+    except Exception as e:
+        check("request line over 1 MiB closes the connection", False, repr(e))
+
+    # Unauthenticated connections are capped; the next one is dropped before
+    # the hello, and slots come back once the idle sockets go away.
+    idle = []
+    try:
+        for _ in range(MAX_PENDING_HANDSHAKES):
+            idle.append(raw_connection(port))
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            extra = sock.recv(4096)
+        except (ConnectionResetError, socket.timeout) as e:
+            extra = repr(e).encode()
+        sock.close()
+        check("connections over the pending handshake cap are dropped", extra == b"", repr(extra[:80]))
+    finally:
+        for s, f, _ in idle:
+            f.close()
+            s.close()
+    deadline = time.monotonic() + 5
+    recovered = False
+    while not recovered and time.monotonic() < deadline:
+        try:
+            Agent(port, key).close()
+            recovered = True
+        except (ConnectionError, ValueError, OSError, AuthError):
+            time.sleep(0.2)
+    check("handshake slots are released when idle clients leave", recovered)
 
     # The client detects an agent that answers with a wrong proof.
     try:

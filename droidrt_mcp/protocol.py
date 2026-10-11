@@ -13,7 +13,8 @@ import logging
 import sys
 import threading
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -34,6 +35,9 @@ SERVER_BUSY = -32000
 MAX_LINE_BYTES = 4 * 1024 * 1024
 MAX_BATCH = 32
 MAX_PENDING = 64
+# How long in flight requests may still finish after stdin closes, before the
+# server shuts down anyway (the client is gone and nobody reads the answers).
+DRAIN_SECONDS = 5.0
 
 
 def redact(text: Any) -> str:
@@ -133,6 +137,7 @@ class McpServer:
     version: str
     instructions: str | None = None
     workers: int = 4
+    drain_seconds: float = DRAIN_SECONDS
     tools: dict[str, Tool] = field(default_factory=dict)
     resources: dict[str, Resource] = field(default_factory=dict)
     templates: list[ResourceTemplate] = field(default_factory=list)
@@ -148,6 +153,10 @@ class McpServer:
         self._pool: ThreadPoolExecutor | None = None
         self._pending = 0
         self._pending_lock = threading.Lock()
+        # Pooled requests by id: False while running, True once cancelled.
+        self._inflight: dict[tuple, bool] = {}
+        self._futures: set[Future] = set()
+        self._out_broken = False
 
     # ------------------------------------------------------------ registry
 
@@ -170,12 +179,18 @@ class McpServer:
     # ------------------------------------------------------------ output
 
     def send(self, message: dict) -> None:
-        if self._out is None:
+        if self._out is None or self._out_broken:
             return
         line = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
         with self._write_lock:
-            self._out.write(line + "\n")
-            self._out.flush()
+            try:
+                self._out.write(line + "\n")
+                self._out.flush()
+            except (OSError, ValueError) as e:
+                # The client went away (broken pipe or closed stream). Later
+                # messages are dropped instead of raising in every thread.
+                self._out_broken = True
+                log.info("cannot write to the client: %s", e)
 
     def notify(self, method: str, params: dict | None = None) -> None:
         msg = {"jsonrpc": "2.0", "method": method}
@@ -245,7 +260,9 @@ class McpServer:
                 self.client_ready = True
                 if self.on_initialized:
                     threading.Thread(target=self._safe_initialized, daemon=True).start()
-        elif method in ("notifications/cancelled", "notifications/roots/list_changed", "notifications/progress"):
+        elif method == "notifications/cancelled":
+            self.cancel(params.get("requestId"))
+        elif method in ("notifications/roots/list_changed", "notifications/progress"):
             pass
         else:
             log.debug("ignoring notification %s", method)
@@ -368,6 +385,35 @@ class McpServer:
             raise RpcError(RESOURCE_NOT_FOUND, f"Resource not available: {e}", {"uri": uri}) from None
         return {"contents": [{"uri": uri, "mimeType": mime, "text": text}]}
 
+    # ------------------------------------------------------------ cancellation
+
+    @staticmethod
+    def _id_key(msg_id: Any) -> tuple | None:
+        """Dictionary key for a request id: 1 and "1" are different ids."""
+        if isinstance(msg_id, bool) or not isinstance(msg_id, (str, int)):
+            return None
+        return (type(msg_id).__name__, msg_id)
+
+    def cancel(self, request_id: Any) -> bool:
+        """Mark an in flight pooled request as cancelled. Its response is never
+        sent; a request still waiting in the queue does not run at all. Unknown
+        or finished ids are ignored, as the specification asks."""
+        key = self._id_key(request_id)
+        if key is None:
+            return False
+        with self._pending_lock:
+            if key not in self._inflight:
+                return False
+            self._inflight[key] = True
+        log.info("request %r cancelled by the client", request_id)
+        return True
+
+    def _cancelled(self, key: tuple | None) -> bool:
+        if key is None:
+            return False
+        with self._pending_lock:
+            return self._inflight.get(key, False)
+
     # ------------------------------------------------------------ loop
 
     def serve(self, stdin=None, stdout=None) -> None:
@@ -375,7 +421,9 @@ class McpServer:
         slow tool call does not block ping or other requests."""
         stdin = stdin or sys.stdin
         self._out = stdout or sys.stdout
+        self._out_broken = False
         self._pool = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="mcp")
+        drain = self.drain_seconds
         try:
             while True:
                 line = stdin.readline(MAX_LINE_BYTES + 1)
@@ -394,39 +442,78 @@ class McpServer:
                 if msg is None:
                     for resp in self.handle_line(line):
                         self.send(resp)  # type: ignore[arg-type]
-                elif not self._reserve():
+                    continue
+                key = self._id_key(msg.get("id")) if "id" in msg else None
+                status = self._reserve(key)
+                if status == "busy":
                     # Bounded queue: a client flooding slow calls gets an error
                     # instead of growing memory without limit.
                     if "id" in msg:
                         self.send(error_response(_safe_id(msg), RpcError(SERVER_BUSY, "server busy")))
+                elif status == "duplicate":
+                    self.send(error_response(_safe_id(msg), RpcError(
+                        INVALID_REQUEST, "Invalid Request: id is already used by a request in progress")))
                 else:
                     try:
-                        self._pool.submit(self._run_line, line)
+                        fut = self._pool.submit(self._run_line, line, key)
                     except RuntimeError:
-                        self._release()
+                        self._release(key)
                         raise
+                    with self._pending_lock:
+                        self._futures.add(fut)
+                    fut.add_done_callback(lambda f, k=key: self._forget_future(f, k))
+        except BaseException:
+            # SIGTERM or Ctrl-C: do not wait for slow tool calls, the process
+            # is about to stop and the device cleanup must run first.
+            drain = 0
+            raise
         finally:
-            self._pool.shutdown(wait=True, cancel_futures=False)
+            with self._pending_lock:
+                running = set(self._futures)
+            if running and drain > 0:
+                wait_futures(running, timeout=drain)
+            # Queued requests are dropped; running ones finish in their worker
+            # thread while the caller cleans up, and their answers go nowhere.
+            self._pool.shutdown(wait=False, cancel_futures=True)
 
-    def _reserve(self) -> bool:
+    def _forget_future(self, fut: Future, key: tuple | None) -> None:
         with self._pending_lock:
-            if self._pending >= MAX_PENDING:
-                return False
-            self._pending += 1
-            return True
+            self._futures.discard(fut)
+        if fut.cancelled():
+            # Dropped from the queue at shutdown: _run_line never ran, so the
+            # slot is given back here.
+            self._release(key)
 
-    def _release(self) -> None:
+    def _reserve(self, key: tuple | None = None) -> str:
+        with self._pending_lock:
+            if key is not None and key in self._inflight:
+                return "duplicate"
+            if self._pending >= MAX_PENDING:
+                return "busy"
+            self._pending += 1
+            if key is not None:
+                self._inflight[key] = False
+            return "ok"
+
+    def _release(self, key: tuple | None = None) -> None:
         with self._pending_lock:
             self._pending -= 1
+            if key is not None:
+                self._inflight.pop(key, None)
 
-    def _run_line(self, line: str) -> None:
+    def _run_line(self, line: str, key: tuple | None = None) -> None:
         try:
-            for resp in self.handle_line(line):
+            if self._cancelled(key):
+                return
+            responses = self.handle_line(line)
+            if self._cancelled(key):
+                return  # the client cancelled it: no response at all
+            for resp in responses:
                 self.send(resp)  # type: ignore[arg-type]
         except Exception as e:
             log.error("failed to handle message: %s", e)
         finally:
-            self._release()
+            self._release(key)
 
     @staticmethod
     def _pooled_message(line: str) -> dict | None:

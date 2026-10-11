@@ -8,6 +8,9 @@
 #   PLATFORM                     compile platform (default android-34)
 #   JAVA_HOME                    JDK used for javac, keytool and apksigner
 set -eu
+# pipefail is POSIX since 2024 but older dash builds lack it; use it when present.
+# shellcheck disable=SC3040
+if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi
 
 cd "$(dirname "$0")"
 ROOT=$(pwd)
@@ -34,7 +37,9 @@ fi
 for f in "$BT/d8" "$BT/aapt2" "$BT/zipalign" "$BT/apksigner" "$ANDROID_JAR"; do
     [ -e "$f" ] || { echo "missing: $f" >&2; exit 1; }
 done
-command -v javac >/dev/null || { echo "javac not found (set JAVA_HOME)" >&2; exit 1; }
+for t in javac keytool zip; do
+    command -v "$t" >/dev/null || { echo "$t not found (set JAVA_HOME, install zip)" >&2; exit 1; }
+done
 
 MIN_SDK=30
 TARGET_SDK=34
@@ -78,10 +83,18 @@ echo "zipalign"
 
 if [ ! -f "$KEYSTORE" ]; then
     echo "keytool (new local debug keystore)"
-    keytool -genkeypair -noprompt -keystore "$KEYSTORE" -storetype PKCS12 \
+    # Kept only under build/ (git ignored). Write to a temporary name so an
+    # interrupted run never leaves a half written keystore behind.
+    rm -f "$KEYSTORE.tmp"
+    if ! keytool -genkeypair -noprompt -keystore "$KEYSTORE.tmp" -storetype PKCS12 \
         -storepass android -keypass android -alias droidrtdebug \
         -keyalg RSA -keysize 2048 -validity 10000 \
-        -dname "CN=droidrt debug" >/dev/null 2>&1
+        -dname "CN=droidrt debug" >"$TMP/keytool.log" 2>&1; then
+        cat "$TMP/keytool.log" >&2
+        rm -f "$KEYSTORE.tmp"
+        exit 1
+    fi
+    mv "$KEYSTORE.tmp" "$KEYSTORE"
 fi
 
 echo "apksigner"

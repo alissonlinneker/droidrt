@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import stat
 from pathlib import Path
 
 from .schema import NAME_RE, PACKAGE_RE, ToolError, clean_text, prefixed_name, sanitize_name, validate_tool
@@ -67,13 +69,28 @@ def flow_to_tool(data: object, package: str, slug: str, stem: str) -> dict:
     return validate_tool(tool, package)
 
 
+def _read_limited(path: Path) -> bytes:
+    """Read a regular file of at most MAX_FILE_BYTES without following a
+    symlink swapped in after the directory was listed."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ToolError(f"{path.name}: not a regular file")
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            data = f.read(MAX_FILE_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > MAX_FILE_BYTES:
+        raise ToolError(f"{path.name}: larger than {MAX_FILE_BYTES} bytes")
+    return data
+
+
 def load_flow(path: Path, package: str, slug: str) -> dict:
     path = Path(path)
-    if path.stat().st_size > MAX_FILE_BYTES:
-        raise ToolError(f"{path.name}: larger than {MAX_FILE_BYTES} bytes")
+    raw = _read_limited(path)
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as e:
         raise ToolError(f"{path.name}: invalid JSON ({e})") from None
     try:
         return flow_to_tool(data, package, slug, path.stem)

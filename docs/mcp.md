@@ -108,12 +108,12 @@ These work with any app. Every `package` argument must match `^[a-zA-Z][\w.]*$`,
 | `tap` | Taps one target: an element id, a text (exact, then contains, then content description), a resource id, or the point `x`,`y` | `package` and exactly one of `element_id`, `text`, `resource_id`, or `x` with `y` |
 | `type_text` | Replaces the text of an editable field (the focused or first editable one when `element_id` is omitted). `submit: true` sends the IME action afterwards | `package`, `text` (up to 4096 characters), `element_id`, `submit` (default `false`) |
 | `swipe` | Swipes on the app's display. The direction is where the finger moves: `up` scrolls the content down | `package`, `direction` (`up`, `down`, `left`, `right`) |
-| `press_key` | Presses a key on the app's display | `package`, `key` (`back`, `enter`, `home`) |
+| `press_key` | Presses a key on the app's own display (refused when the app has no droidrt display, so a key never reaches another app) | `package`, `key` (`back`, `enter`, `home`) |
 | `wait_for` | Waits until an element appears, matched by text (case insensitive contains) or resource id | `package`, exactly one of `text` or `resource_id`, `timeout_ms` (100 to 120000, default 10000) |
 | `get_notifications` | Lists active and recently posted notifications of allowed packages, optionally for one package. Returns `{"count", "notifications", "truncated"}` (see below) | `package` (optional) |
 | `reply_notification` | Replies through the quick reply (RemoteInput) action of a notification | `key` (up to 512 characters), `text` (up to 4096 characters) |
 | `run_intent` | Starts an activity with an intent (`am start`) on the app's display, opening the app headless first when needed. The intent always targets `package`: a `component` must belong to it | `package`, `action`, `data`, `extras` (string, number or boolean values), `mime_type`, `component`, `categories` |
-| `record_flow` | Saves a reusable flow and exposes it as a new tool named `<app>_<name>` | `package`, `name` (`^[a-z][a-z0-9_]{0,47}$`), `description` (up to 1024 characters), `steps` (1 to 200), `input_schema` (optional) |
+| `record_flow` | Saves a reusable flow and exposes it as a new tool named `<app>_<name>` | `package`, `name` (`^[a-z][a-z0-9_]{0,47}$`), `description` (up to 1024 characters), `steps` (1 to 200), `input_schema` (optional), `overwrite` (default `false`) |
 
 `get_notifications` returns `count` (the number of matching notifications), `notifications` (at most 50 entries, about 100 KB in total, every text field cut at 2000 characters) and `truncated: true` when something was left out. Each notification has a `key`, its package, title, text and `actions`; an action with `remoteInput` is a quick reply.
 
@@ -165,6 +165,8 @@ On top of the generic tools, the server exposes per-app tools built by `semantic
 2. **Recorded flows** saved with `record_flow`.
 3. **Generated tools** derived from the app manifest (up to 15 per app): browsable deep links, exported activities with intent filters and `ACTION_SEND` share targets. The server pulls the base APK of each app once per version into `~/Library/Caches/droidrt/apks/<package>/<versionCode>/` to read its manifest.
 
+Generated link tools keep the scheme and host fixed: for example a browser's `open_url` tool takes an `address` without a scheme and always opens it over `https://`, so an argument can never switch to `javascript:`, `intent:` or another host.
+
 When two sources produce the same name, the higher precedence wins, and generic tool names always win over semantic ones. With the VM running and the semantic tools loaded, a typical installation exposes about a hundred tools: the 14 generic ones plus the semantic tools of every installed app. Use `DROIDRT_MCP_PACKAGES` to keep the list short.
 
 Semantic tools load in the background when the server starts, so the first `tools/list` answers right away with the generic tools. When the semantic tools are ready, and again whenever `record_flow` saves a flow, the server sends `notifications/tools/list_changed` and clients fetch the new list. Packages considered are the apps installed in the VM (when it is running), the apps with a launcher, the apps with curated definitions and the apps with recorded flows.
@@ -173,7 +175,7 @@ Each semantic tool runs either an **intent** (for example a deep link opened wit
 
 ## Recording flows
 
-`record_flow` writes `~/Library/Application Support/droidrt/flows/<package>/<name>.json` and reloads the tools. The new tool is named `<app slug>_<name>` and the response lists the tools now available for that package.
+`record_flow` writes `~/Library/Application Support/droidrt/flows/<package>/<name>.json` atomically and reloads the tools. An existing flow with the same name is kept unless `overwrite` is `true`. The new tool is named `<app slug>_<name>` and the response lists the tools now available for that package.
 
 Each step is an object with exactly one key:
 

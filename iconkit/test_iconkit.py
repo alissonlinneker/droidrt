@@ -476,6 +476,139 @@ class ResolverBudgetTest(unittest.TestCase):
         self.assertIsNone(ik.Resolver(res).color("@color/a"))
 
 
+class UntrustedInputTest(unittest.TestCase):
+    """Regression tests: hostile aapt2 output and resources never raise out of extract_icon."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.work = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_xmltree_element_without_name(self):
+        root = ik.parse_xmltree("N: android=x\nE: \nE:  \n  E: vector (line=1)\n")
+        self.assertEqual(root.name, "vector")
+
+    def test_xmltree_element_cap(self):
+        text = "E: layer-list (line=1)\n" + "  E: item (line=2)\n" * (ik.MAX_XML_ELEMENTS + 1)
+        with self.assertRaisesRegex(ik.IconError, "too large"):
+            ik.parse_xmltree(text)
+
+    def test_degenerate_arcs_do_not_raise(self):
+        # Radii that underflow when squared used to raise ZeroDivisionError.
+        self.assertEqual(ik.parse_path_data("M0 0 A1e-200 1e-200 0 0 1 10 10"), [("M", 0.0, 0.0), ("L", 10.0, 10.0)])
+        for bad in ("M0 0 A1e200 1e200 0 0 1 10 10", "M0 0 L1e999 0", "M0 0 Lnan 0", "M0 0 L1e7 0"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                ik.parse_path_data(bad)
+
+    def test_hostile_numbers_stay_finite_and_in_range(self):
+        path = {"pathData": "M0,0 L10,10 Z", "fillColor": "#ff000000", "strokeLineCap": "99999999999999999999999",
+                "strokeLineJoin": "-5", "fillAlpha": "1e300", "strokeWidth": "1e308", "strokeMiterLimit": "nan"}
+        bad = {"pathData": "M0 0 A1e-300 1e-300 0 0 1 1e999 5", "fillColor": "#ff000000"}
+        group = ik.XmlNode("group", {"scaleX": "1e300", "rotation": "1e300"}, [ik.XmlNode("path", path, [])])
+        vec = ik.XmlNode("vector", {"viewportWidth": "1e-300", "viewportHeight": "0", "alpha": "-3"},
+                         [ik.XmlNode("path", path, []), ik.XmlNode("path", bad, []), group])
+        node = ik.Resolver(None).xml_drawable(vec, 108, 0)
+        json.dumps(node, allow_nan=False)
+        self.assertEqual((node["vw"], node["vh"], node["alpha"]), (24.0, 24.0, 0.0))
+        self.assertEqual(len(node["children"]), 2)  # the non finite path is dropped
+        p = node["children"][0]
+        self.assertEqual((p["cap"], p["join"], p["fillAlpha"], p["miter"]), (0, 0, 1.0, 4.0))
+        self.assertLessEqual(p["strokeWidth"], 1e4)
+        self.assertLessEqual(node["children"][1]["scaleX"], 1e4)
+
+    def test_gradient_stops_clamped_and_sorted(self):
+        grad = ik.XmlNode("gradient", {}, [ik.XmlNode("item", {"offset": "7", "color": "#ff000000"}, []),
+                                           ik.XmlNode("item", {"offset": "-1e9", "color": "#ffffffff"}, [])])
+        self.assertEqual([s[0] for s in ik._gradient_stops(grad, ik.Resolver(None), 0)], [0.0, 1.0])
+
+    def test_inset_fraction_clamped(self):
+        self.assertEqual(ik.Resolver(None).fraction("1e300dp", 108), 2.0)
+        self.assertEqual(ik.Resolver(None).fraction("-1e300%", 108), -2.0)
+
+    def test_missing_icon_entry_resolves_to_nothing(self):
+        apk = self.work / "app.apk"
+        with zipfile.ZipFile(apk, "w") as z:
+            z.writestr("AndroidManifest.xml", b"")
+        with ik.Resources("aapt2", [], self.work) as res:
+            # The badging path is not in the zip: this used to escape as KeyError.
+            self.assertIsNone(ik.spec_from_resources(res, apk, "res/mipmap/missing.png"))
+
+    def test_bitmap_count_budget(self):
+        apk = self.work / "app.apk"
+        with zipfile.ZipFile(apk, "w") as z:
+            for i in range(ik.MAX_BITMAPS + 1):
+                z.writestr(f"res/{i}.png", solid_png(4, (255, 0, 0, 255)))
+        work = self.work / "w"
+        work.mkdir()
+        with ik.Resources("aapt2", [], work) as res:
+            for i in range(ik.MAX_BITMAPS):
+                res.extract(apk, f"res/{i}.png")
+            with self.assertRaisesRegex(ik.IconError, "too complex"):
+                res.extract(apk, f"res/{ik.MAX_BITMAPS}.png")
+        mode = (work / "res1.png").stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_xml_dump_budget(self):
+        res = ik.Resources("aapt2", [], self.work)
+        with mock.patch.object(ik, "_run", return_value="E: vector (line=1)\n"):
+            for i in range(ik.MAX_XML_FILES):
+                res.xml(Path("a.apk"), f"res/{i}.xml")
+            with self.assertRaisesRegex(ik.IconError, "too complex"):
+                res.xml(Path("a.apk"), "res/one_more.xml")
+
+    def test_run_bounds_output_and_time(self):
+        with self.assertRaisesRegex(ik.IconError, "larger than"):
+            ik._run(["/bin/sh", "-c", "yes aaaaaaaaaaaaaaaa"], timeout=20, limit=100_000)
+        start = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            ik._run(["/bin/sh", "-c", "sleep 30"], timeout=0.5)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertEqual(ik._run(["/bin/echo", "hi"]), "hi\n")
+
+    def test_extract_icon_never_raises(self):
+        apk = self.work / "app.apk"
+        apk.write_bytes(b"PK")
+        for exc in (KeyError("x"), RuntimeError("encrypted"), ZeroDivisionError(), RecursionError(),
+                    AttributeError("x"), MemoryError()):
+            with self.subTest(exc=type(exc).__name__), mock.patch.object(ik, "build_spec", side_effect=exc), \
+                    mock.patch("sys.stderr"):
+                self.assertFalse(ik.extract_icon([apk], self.work / "out.png"))
+        with mock.patch("sys.stderr"):
+            self.assertFalse(ik.extract_icon([None], self.work / "out.png"))
+
+    def test_failed_render_keeps_previous_icon(self):
+        out = self.work / "icon.png"
+        out.write_bytes(b"previous")
+        failed = subprocess.CompletedProcess([], 1, "", "boom")
+        with mock.patch.object(ik, "ensure_compose", return_value=Path("/bin/false")), \
+                mock.patch.object(ik.subprocess, "run", return_value=failed), mock.patch("sys.stderr"):
+            self.assertFalse(ik.render_spec({"kind": "legacy", "layer": None}, out))
+        self.assertEqual(out.read_bytes(), b"previous")
+        self.assertEqual([p.name for p in self.work.iterdir()], ["icon.png"])
+
+    def test_concurrent_builds_run_once(self):
+        src = self.work / "compose.swift"
+        src.write_text("// source")
+        binary = self.work / "build" / "compose"
+        count = self.work / "count"
+        script = self.work / "build.sh"
+        script.write_text(f"sleep 1\necho x >> {count}\nmkdir -p {binary.parent}\n"
+                          f"echo bin > {binary}.tmp && mv {binary}.tmp {binary}\n")
+        import threading
+        results = []
+        with mock.patch.object(ik, "COMPOSE_SRC", src), mock.patch.object(ik, "COMPOSE_BIN", binary), \
+                mock.patch.object(ik, "BUILD_SCRIPT", script):
+            threads = [threading.Thread(target=lambda: results.append(ik.ensure_compose())) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(30)
+        self.assertEqual(results, [binary] * 3)
+        self.assertEqual(count.read_text().count("x"), 1)
+
+
 @unittest.skipUnless(ik.COMPOSE_BIN.is_file(), "build/compose not built (run build.sh)")
 class ComposeLimitsTest(unittest.TestCase):
     def run_compose(self, spec: dict, tmp: Path) -> tuple[subprocess.CompletedProcess, Path]:
@@ -527,6 +660,42 @@ class ComposeLimitsTest(unittest.TestCase):
             r, _ = self.run_compose({"kind": "legacy", "layer": node}, Path(tmp))
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertLess(time.monotonic() - start, 10.0)
+
+
+    def test_hostile_numbers_do_not_crash(self):
+        # Int(CGFloat) traps on values outside Int; a huge cap used to kill compose.
+        path = {"kind": "path", "d": [["M", 0, 0], ["L", 1e300, -1e300], ["C", 1, 2, 3, 4, 5, 6], ["Z"]],
+                "fill": {"gradient": {"type": "radial", "cx": 1e308, "cy": -1e308, "r": 1e308,
+                                      "stops": [[1e300, [255, 0, 0, 255]], [-5, [999, -9, 0, 1e9]]]}},
+                "stroke": {"color": [0, 0, 0, 255]}, "strokeWidth": 1e308, "cap": 1e300, "join": -1e300,
+                "miter": 1e308, "fillAlpha": 1e300}
+        group = {"kind": "group", "scaleX": 1e300, "scaleY": 1e300, "rotation": 1e300, "children": [path]}
+        nested = group
+        for _ in range(60):
+            nested = {"kind": "group", "scaleX": 1e4, "scaleY": 1e4, "children": [nested]}
+        layer = {"type": "layers", "items": [
+            {"inset": [1e300, -1e300, 0.5, 2], "drawable": {"type": "color", "color": [1, 2, 3, 255]}},
+            {"inset": [0, 0, 0, 0], "drawable": {"type": "vector", "vw": 1e-300, "vh": 24, "children": [path]}},
+            {"inset": [0, 0, 0, 0], "drawable": {"type": "vector", "vw": 24, "vh": 24, "children": [path, nested]}},
+            {"inset": [0, 0, 0, 0], "drawable": {"type": "shape", "shape": "rect", "radius": 1e308,
+                                                 "fill": {"color": [0, 0, 255, 255]},
+                                                 "stroke": {"color": [0, 0, 0, 255]}, "strokeWidth": -1e308}},
+        ]}
+        with tempfile.TemporaryDirectory() as tmp:
+            r, out = self.run_compose({"kind": "legacy", "layer": layer, "size": 1e300}, Path(tmp))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(ik.bitmap_dimensions(out.read_bytes()), ("png", 256, 256))
+
+    def test_repeated_bitmap_decoded_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "big.png").write_bytes(solid_png(1024, (37, 211, 102, 255)))
+            leaf = {"type": "bitmap", "path": str(tmp / "big.png")}
+            layer = {"type": "layers", "items": [{"inset": [0, 0, 0, 0], "drawable": leaf}] * 2000}
+            start = time.monotonic()
+            r, _ = self.run_compose({"kind": "legacy", "layer": layer}, tmp)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertLess(time.monotonic() - start, 15.0)
 
 
 if __name__ == "__main__":

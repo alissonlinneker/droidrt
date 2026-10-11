@@ -17,6 +17,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.util.concurrent.Semaphore;
 import java.util.regex.Pattern;
 
 import javax.crypto.Mac;
@@ -46,6 +47,11 @@ import javax.crypto.spec.SecretKeySpec;
  *
  *    HMAC is HMAC-SHA256 over the UTF-8 text, hex encoded. A first line that
  *    is not a well formed auth object closes the connection silently.
+ *
+ * Resource limits: the handshake must complete within HANDSHAKE_TIMEOUT_MS
+ * of the accept (a total deadline, not a per read timeout), its line may not
+ * exceed MAX_HANDSHAKE_LINE_BYTES, and at most MAX_PENDING_HANDSHAKES
+ * unauthenticated and MAX_CONNECTIONS total connections are served at once.
  */
 final class AgentServer {
     static final String SOCKET_NAME = "droidrt_agent";
@@ -54,11 +60,25 @@ final class AgentServer {
     private static final int UID_SHELL = 2000;
     static final int HANDSHAKE_VERSION = 2;
     static final int MAX_LINE_BYTES = 1024 * 1024;
+    /** The auth line is about 150 bytes; nothing bigger is buffered before auth. */
+    private static final int MAX_HANDSHAKE_LINE_BYTES = 4096;
+    /** Responses above this are replaced by an error (the host reads up to 64 MiB). */
+    private static final int MAX_RESPONSE_CHARS = 32 * 1024 * 1024;
     private static final int HANDSHAKE_TIMEOUT_MS = 10_000;
+    /**
+     * Anything on the host can open the forwarded port, so connections that
+     * have not authenticated yet are capped: a flood of idle sockets must not
+     * be able to exhaust threads or memory in the agent process.
+     */
+    private static final int MAX_PENDING_HANDSHAKES = 8;
+    private static final int MAX_CONNECTIONS = 32;
     private static final int NONCE_BYTES = 16;
     private static final Pattern NONCE_HEX = Pattern.compile("^[0-9a-fA-F]{32}$");
     private static final Pattern MAC_HEX = Pattern.compile("^[0-9a-fA-F]{64}$");
     private static final SecureRandom RANDOM = new SecureRandom();
+
+    private static final Semaphore PENDING = new Semaphore(MAX_PENDING_HANDSHAKES);
+    private static final Semaphore CONNECTIONS = new Semaphore(MAX_CONNECTIONS);
 
     private static Thread acceptor;
 
@@ -68,7 +88,7 @@ final class AgentServer {
     /** Starts the accept loop once per process. Safe to call from both services. */
     static synchronized void start(Context context) {
         AgentKey.init(context);
-        if (acceptor != null) {
+        if (acceptor != null && acceptor.isAlive()) {
             return;
         }
         acceptor = new Thread(AgentServer::acceptLoop, "droidrt-accept");
@@ -86,9 +106,29 @@ final class AgentServer {
                         closeQuietly(socket);
                         continue;
                     }
-                    Thread worker = new Thread(() -> serve(socket), "droidrt-conn");
-                    worker.setDaemon(true);
-                    worker.start();
+                    if (!CONNECTIONS.tryAcquire()) {
+                        Log.w(TAG, "dropped connection: too many connections");
+                        closeQuietly(socket);
+                        continue;
+                    }
+                    if (!PENDING.tryAcquire()) {
+                        CONNECTIONS.release();
+                        Log.w(TAG, "dropped connection: too many pending handshakes");
+                        closeQuietly(socket);
+                        continue;
+                    }
+                    try {
+                        Thread worker = new Thread(() -> serve(socket), "droidrt-conn");
+                        worker.setDaemon(true);
+                        worker.start();
+                    } catch (RuntimeException | OutOfMemoryError e) {
+                        // Thread creation can fail under memory pressure; drop
+                        // this connection but keep accepting.
+                        PENDING.release();
+                        CONNECTIONS.release();
+                        closeQuietly(socket);
+                        Log.w(TAG, "could not start connection thread", e);
+                    }
                 }
             } catch (IOException e) {
                 Log.w(TAG, "server socket failed, retrying", e);
@@ -114,17 +154,26 @@ final class AgentServer {
         return false;
     }
 
+    /**
+     * Serves one connection. Every exit path releases the connection slots and
+     * closes the socket; nothing may escape, because an uncaught exception on
+     * any thread kills the whole agent process on Android.
+     */
     private static void serve(LocalSocket socket) {
+        boolean pending = true;
         try (LocalSocket s = socket;
              InputStream in = new BufferedInputStream(s.getInputStream());
              OutputStream out = s.getOutputStream()) {
+            long deadline = System.nanoTime() + HANDSHAKE_TIMEOUT_MS * 1_000_000L;
             s.setSoTimeout(HANDSHAKE_TIMEOUT_MS);
-            if (!handshake(in, out)) {
+            if (!handshake(s, in, out, deadline)) {
                 return;
             }
             s.setSoTimeout(0);
+            pending = false;
+            PENDING.release();
             String line;
-            while ((line = readLine(in)) != null) {
+            while ((line = readLine(in, MAX_LINE_BYTES, s, 0)) != null) {
                 if (line.trim().isEmpty()) {
                     continue;
                 }
@@ -132,6 +181,13 @@ final class AgentServer {
             }
         } catch (IOException e) {
             Log.d(TAG, "connection closed: " + e.getMessage());
+        } catch (RuntimeException | Error e) {
+            Log.w(TAG, "connection aborted", e);
+        } finally {
+            if (pending) {
+                PENDING.release();
+            }
+            CONNECTIONS.release();
         }
     }
 
@@ -140,11 +196,12 @@ final class AgentServer {
      * proved the key and the proof was sent back; false means the caller must
      * close the connection without reading anything else.
      */
-    private static boolean handshake(InputStream in, OutputStream out) throws IOException {
+    private static boolean handshake(LocalSocket s, InputStream in, OutputStream out, long deadline)
+            throws IOException {
         String agentNonce = randomNonce();
         writeLine(out, jsonLine("hello", "droidrt-agent", "v", HANDSHAKE_VERSION, "nonce", agentNonce));
 
-        String line = readLine(in);
+        String line = readLine(in, MAX_HANDSHAKE_LINE_BYTES, s, deadline);
         if (line == null) {
             return false;
         }
@@ -214,18 +271,34 @@ final class AgentServer {
 
     /**
      * Reads one '\n' terminated UTF-8 line (a trailing '\r' is dropped).
-     * Returns null at end of stream. A line longer than MAX_LINE_BYTES throws,
+     * Returns null at end of stream. A line longer than maxBytes throws,
      * which closes the connection.
+     *
+     * When deadline (a System.nanoTime value) is not 0, the whole line must
+     * arrive before it: the socket timeout is shrunk to the time left before
+     * every read that may block, so a client sending one byte at a time
+     * cannot stretch the handshake past the deadline.
      */
-    static String readLine(InputStream in) throws IOException {
+    static String readLine(InputStream in, int maxBytes, LocalSocket s, long deadline) throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream(256);
         int b;
-        while ((b = in.read()) != -1) {
+        while (true) {
+            if (deadline != 0 && in.available() == 0) {
+                long leftMs = (deadline - System.nanoTime()) / 1_000_000L;
+                if (leftMs <= 0) {
+                    throw new IOException("handshake timed out");
+                }
+                s.setSoTimeout((int) Math.min(Integer.MAX_VALUE, leftMs));
+            }
+            b = in.read();
+            if (b == -1) {
+                break;
+            }
             if (b == '\n') {
                 return decodeLine(buf);
             }
-            if (buf.size() >= MAX_LINE_BYTES) {
-                throw new IOException("line exceeds " + MAX_LINE_BYTES + " bytes");
+            if (buf.size() >= maxBytes) {
+                throw new IOException("line exceeds " + maxBytes + " bytes");
             }
             buf.write(b);
         }
@@ -260,6 +333,17 @@ final class AgentServer {
             resp.put("id", id);
             resp.put("ok", true);
             resp.put("result", result == null ? JSONObject.NULL : result);
+            // Serialize inside the try: a huge tree can run out of memory
+            // here, and that must become an error reply, not a dead thread.
+            String text = resp.toString();
+            if (text == null) {
+                throw new AgentException("result is not serializable");
+            }
+            if (text.length() > MAX_RESPONSE_CHARS) {
+                throw new AgentException("response too large (" + text.length()
+                        + " chars); narrow the query with package, displayId or maxDepth");
+            }
+            return text;
         } catch (Throwable t) {
             String message = t instanceof AgentException
                     ? t.getMessage()

@@ -23,10 +23,12 @@ import json
 import math
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,7 +45,16 @@ MAX_NODES = 5_000             # drawable/paint/vector nodes per extraction
 MAX_TOTAL_PATH_OPS = 200_000  # path commands summed over the whole icon
 MAX_BITMAP_PX = 4096          # largest accepted bitmap side, in pixels
 MAX_SPEC_BYTES = 16 * 1024 * 1024
+MAX_BITMAPS = 64                         # distinct bitmap entries copied out per extraction
+MAX_BITMAP_BYTES = 64 * 1024 * 1024      # their total size
+MAX_XML_FILES = 256                      # distinct XML resources dumped per extraction
+MAX_XML_ELEMENTS = 20_000                # elements kept from one xmltree dump
+MAX_COORD = 1e6                          # largest magnitude accepted for a path coordinate
+MAX_DUMP_BYTES = 256 * 1024 * 1024       # aapt2 output read for one command
+MAX_XML_DUMP_BYTES = 16 * 1024 * 1024    # aapt2 output read for one xmltree dump
+AAPT2_TIMEOUT = 120
 COMPOSE_TIMEOUT = 20
+BUILD_TIMEOUT = 600
 ADAPTIVE_DP = 108.0
 LEGACY_DP = 48.0
 
@@ -181,7 +192,10 @@ def parse_dimension(text: str) -> tuple[float, str] | None:
     m = re.fullmatch(r"\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s*(dp|dip|sp|px|pt|in|mm|%p|%)?\s*", text)
     if not m:
         return None
-    return float(m.group(1)), (m.group(2) or "")
+    value = float(m.group(1))
+    if not math.isfinite(value):
+        return None
+    return value, (m.group(2) or "")
 
 
 class _PathScanner:
@@ -203,7 +217,10 @@ class _PathScanner:
         if not m:
             raise ValueError(f"bad number in pathData at {self.i}")
         self.i = m.end()
-        return float(m.group(0))
+        value = float(m.group(0))
+        if not (math.isfinite(value) and abs(value) <= MAX_COORD):
+            raise ValueError(f"number out of range in pathData at {m.start()}")
+        return value
 
     def flag(self) -> float:
         self.skip()
@@ -218,7 +235,9 @@ def _arc_to_cubics(x1, y1, rx, ry, phi_deg, large, sweep, x2, y2):
     if (x1 == x2 and y1 == y2):
         return []
     rx, ry = abs(rx), abs(ry)
-    if rx == 0 or ry == 0:
+    # Radii this small (or zero) would underflow when squared below; the arc
+    # is a straight line for any practical purpose.
+    if rx < 1e-9 or ry < 1e-9:
         return [("L", x2, y2)]
     phi = math.radians(phi_deg % 360)
     cp, sp = math.cos(phi), math.sin(phi)
@@ -413,9 +432,37 @@ def find_aapt2() -> str | None:
     return shutil.which("aapt2")
 
 
-def _run(args: list[str], timeout: int = 120) -> str:
-    r = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=timeout)
-    return r.stdout
+def _run(args: list[str], timeout: float = AAPT2_TIMEOUT, limit: int = MAX_DUMP_BYTES) -> str:
+    """Run aapt2 and return its stdout, bounded in time and in size.
+
+    Raises subprocess.TimeoutExpired past `timeout` seconds and IconError when
+    the output grows beyond `limit` bytes; the child is killed in both cases.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    deadline = time.monotonic() + timeout
+    with subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL) as proc:
+        try:
+            fd = proc.stdout.fileno()
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise subprocess.TimeoutExpired(args, timeout)
+                ready, _, _ = select.select([fd], [], [], left)
+                if not ready:
+                    continue
+                chunk = os.read(fd, 1 << 16)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise IconError(f"aapt2 output larger than {limit} bytes")
+                chunks.append(chunk)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+    return b"".join(chunks).decode("utf-8", "replace")
 
 
 @dataclass
@@ -463,11 +510,17 @@ def parse_xmltree(text: str) -> XmlNode | None:
     """Parse `aapt2 dump xmltree` output into a small element tree."""
     root = None
     stack: list[tuple[int, XmlNode]] = []
+    count = 0
     for line in text.splitlines():
         stripped = line.lstrip(" ")
         indent = len(line) - len(stripped)
         if stripped.startswith("E: "):
             m = re.match(r"E: (\S+)", stripped)
+            if not m:
+                continue  # an element without a printable name
+            count += 1
+            if count > MAX_XML_ELEMENTS:
+                raise IconError("xml resource too large")
             node = XmlNode(m.group(1), {}, [])
             while stack and stack[-1][0] >= indent:
                 stack.pop()
@@ -509,6 +562,8 @@ class Resources:
         self._best: dict[tuple, Entry | None] = {}
         self._zips: dict[str, zipfile.ZipFile | None] = {}
         self._n = 0
+        self._bitmap_bytes = 0
+        self._xml_dumps = 0
         for apk in apks:
             parse_resources_dump(_run([aapt2, "dump", "resources", str(apk)]), apk, self.table, self.paths,
                                  self.names)
@@ -565,11 +620,19 @@ class Resources:
         z = self._zip(apk)
         if z is None:
             raise IconError(f"unreadable APK: {apk}")
-        info = z.getinfo(name)
+        try:
+            info = z.getinfo(name)
+        except KeyError:
+            raise UnsafeBitmap(f"missing entry: {name}") from None
         if info.file_size > MAX_ENTRY_BYTES:
             raise IconError(f"entry too large: {name}")
-        with z.open(info) as f:
-            data = f.read(MAX_ENTRY_BYTES + 1)
+        try:
+            with z.open(info) as f:
+                data = f.read(MAX_ENTRY_BYTES + 1)
+        except Exception as exc:  # noqa: BLE001
+            # Encrypted entries (RuntimeError), unknown compression methods
+            # (NotImplementedError), corrupt deflate streams (zlib.error), CRC errors.
+            raise UnsafeBitmap(f"unreadable entry {name}: {exc}") from None
         if len(data) > MAX_ENTRY_BYTES:
             raise IconError(f"entry too large: {name}")
         return data
@@ -580,17 +643,29 @@ class Resources:
         Raises UnsafeBitmap when the format is not PNG, WebP, JPEG or GIF, or
         when either side exceeds MAX_BITMAP_PX, so the compositor never sees it.
         """
+        if self._n >= MAX_BITMAPS:
+            raise IconError("icon too complex")
         data = self.read_bytes(apk, name)
         fmt, _, _ = check_bitmap(data, name)
+        self._bitmap_bytes += len(data)
+        if self._bitmap_bytes > MAX_BITMAP_BYTES:
+            raise IconError("icon too complex")
         self._n += 1
         out = self.workdir / f"res{self._n}.{fmt}"
-        out.write_bytes(data)
+        # The work dir is private (mkdtemp); O_EXCL refuses anything already there.
+        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
         return out
 
     def xml(self, apk: Path, name: str) -> XmlNode | None:
         key = (str(apk), name)
         if key not in self._xml:
-            self._xml[key] = parse_xmltree(_run([self.aapt2, "dump", "xmltree", "--file", name, str(apk)]))
+            self._xml_dumps += 1
+            if self._xml_dumps > MAX_XML_FILES:
+                raise IconError("icon too complex")
+            self._xml[key] = parse_xmltree(_run([self.aapt2, "dump", "xmltree", "--file", name, str(apk)],
+                                                limit=MAX_XML_DUMP_BYTES))
         return self._xml[key]
 
 
@@ -613,34 +688,43 @@ def _ref_name(value: str) -> str | None:
     return m.group(2)
 
 
-def _num(value, default: float = 0.0) -> float:
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return lo if value < lo else hi if value > hi else value
+
+
+def _num(value, default: float = 0.0, lo: float = -MAX_COORD, hi: float = MAX_COORD) -> float:
+    """A finite number from an attribute, clamped to [lo, hi]."""
     if value is None:
         return default
     d = parse_dimension(str(value))
-    return d[0] if d else default
+    return _clamp(d[0], lo, hi) if d else default
 
 
 def _enum(value, names: dict[str, int], default: int) -> int:
+    """One of the values of `names`, from its name or its integer form."""
     if value is None:
         return default
     v = str(value).strip()
     if v in names:
         return names[v]
     try:
-        return int(v, 0)
+        n = int(v, 0) if len(v) <= 32 else default
     except ValueError:
         return default
+    return n if n in names.values() else default
 
 
 def _gradient_stops(node: XmlNode, res: "Resolver", depth: int) -> list:
     stops = []
     for item in node.children:
+        res._charge()
         if item.name != "item":
             continue
         c = res.color(item.attrs.get("color"), depth + 1)
         if c is not None:
-            stops.append([_num(item.attrs.get("offset"), 0.0), list(c)])
+            stops.append([_num(item.attrs.get("offset"), 0.0, 0.0, 1.0), list(c)])
     if stops:
+        stops.sort(key=lambda s: s[0])
         return stops
     sc = res.color(node.attrs.get("startColor"), depth + 1)
     cc = res.color(node.attrs.get("centerColor"), depth + 1)
@@ -764,6 +848,7 @@ class Resolver:
 
     def paint_xml(self, node: XmlNode, depth: int) -> dict | None:
         if node.name == "selector":
+            self._charge(len(node.children))
             items = [i for i in node.children if i.name == "item"]
             plain = [i for i in items if not any(k.startswith("state_") for k in i.attrs)]
             pick = (plain or items or [None])[0]
@@ -772,7 +857,7 @@ class Resolver:
             c = self.color(pick.attrs.get("color"), depth + 1)
             if c is None:
                 return None
-            alpha = _num(pick.attrs.get("alpha"), 1.0)
+            alpha = _num(pick.attrs.get("alpha"), 1.0, 0.0, 1.0)
             return {"color": list(with_alpha(c, alpha))}
         if node.name == "gradient":
             return {"gradient": self.vector_gradient(node, depth)}
@@ -786,7 +871,7 @@ class Resolver:
             "x1": _num(a.get("startX")), "y1": _num(a.get("startY")),
             "x2": _num(a.get("endX")), "y2": _num(a.get("endY")),
             "cx": _num(a.get("centerX")), "cy": _num(a.get("centerY")),
-            "r": _num(a.get("gradientRadius")),
+            "r": _num(a.get("gradientRadius"), 0.0, 0.0),
             "stops": _gradient_stops(node, self, depth),
         }
 
@@ -806,9 +891,9 @@ class Resolver:
         if not d:
             return 0.0
         num, unit = d
-        if unit in ("%", "%p"):
-            return num
-        return num / bounds_dp if bounds_dp else 0.0
+        frac = num if unit in ("%", "%p") else (num / bounds_dp if bounds_dp else 0.0)
+        # Insets, radii and stroke widths beyond twice the bounds draw nothing useful.
+        return _clamp(frac, -2.0, 2.0)
 
     def dp(self, value, default: float, depth: int = 0) -> float:
         if value is None or depth > MAX_DEPTH:
@@ -872,6 +957,7 @@ class Resolver:
         if "drawable" in node.attrs:
             return self.drawable(node.attrs["drawable"], bounds_dp, depth + 1)
         for ch in node.children:
+            self._charge()
             d = self.xml_drawable(ch, bounds_dp, depth + 1)
             if d:
                 return d
@@ -901,6 +987,7 @@ class Resolver:
         if n in ("layer-list", "ripple", "transition"):
             items = []
             for it in node.children:
+                self._charge()
                 if it.name != "item":
                     continue
                 if n == "ripple" and it.attrs.get("id"):
@@ -913,6 +1000,7 @@ class Resolver:
                     items.append({"inset": ins, "drawable": child})
             return {"type": "layers", "items": items} if items else None
         if n in ("selector", "animated-selector", "level-list", "state-list"):
+            self._charge(len(node.children))
             items = [i for i in node.children if i.name == "item"]
             plain = [i for i in items if not any(k.startswith("state_") for k in i.attrs)]
             for it in plain + [i for i in items if i not in plain]:
@@ -922,6 +1010,7 @@ class Resolver:
             return None
         if n in ("animated-vector", "rotate", "scale", "clip", "animation-list", "maskable-icon"):
             if n == "animation-list":
+                self._charge(len(node.children))
                 for it in node.children:
                     d = self._child_drawable(it, bounds_dp, depth)
                     if d:
@@ -937,6 +1026,7 @@ class Resolver:
         kind = _enum(a.get("shape"), {"rectangle": 0, "oval": 1, "line": 2, "ring": 3}, 0)
         out = {"type": "shape", "shape": "oval" if kind == 1 else "rect", "fill": None,
                "radius": 0.0, "stroke": None, "strokeWidth": 0.0}
+        self._charge(len(node.children))
         for ch in node.children:
             ca = ch.attrs
             if ch.name == "solid":
@@ -961,7 +1051,7 @@ class Resolver:
         dx, dy = math.cos(ang), -math.sin(ang)
         cx = self.fraction(a.get("centerX"), 1.0, depth + 1) if a.get("centerX") else 0.5
         cy = self.fraction(a.get("centerY"), 1.0, depth + 1) if a.get("centerY") else 0.5
-        radius = self.fraction(a.get("gradientRadius"), bounds_dp, depth + 1) or 0.5
+        radius = abs(self.fraction(a.get("gradientRadius"), bounds_dp, depth + 1)) or 0.5
         return {
             "type": ["linear", "radial", "sweep"][kind if kind in (0, 1, 2) else 0],
             "x1": 0.5 - dx / 2, "y1": 0.5 - dy / 2, "x2": 0.5 + dx / 2, "y2": 0.5 + dy / 2,
@@ -971,13 +1061,17 @@ class Resolver:
 
     def vector(self, node: XmlNode, depth: int) -> dict:
         a = node.attrs
-        vw = _num(a.get("viewportWidth"), 24.0) or 24.0
-        vh = _num(a.get("viewportHeight"), 24.0) or 24.0
+        # A viewport this small would blow the scale up to infinity in the compositor.
+        vw = _num(a.get("viewportWidth"), 24.0)
+        vh = _num(a.get("viewportHeight"), 24.0)
+        vw = vw if vw >= 1e-3 else 24.0
+        vh = vh if vh >= 1e-3 else 24.0
         tint = self.color(a.get("tint"), depth + 1) if a.get("tint") else None
         return {
             "type": "vector", "vw": vw, "vh": vh,
-            "w": self.dp(a.get("width"), vw), "h": self.dp(a.get("height"), vh),
-            "alpha": _num(a.get("alpha"), 1.0),
+            "w": _clamp(self.dp(a.get("width"), vw), 0.0, MAX_COORD),
+            "h": _clamp(self.dp(a.get("height"), vh), 0.0, MAX_COORD),
+            "alpha": _num(a.get("alpha"), 1.0, 0.0, 1.0),
             "tint": list(tint) if tint else None,
             "children": self.vector_children(node, depth),
         }
@@ -991,9 +1085,9 @@ class Resolver:
             if ch.name == "group":
                 out.append({
                     "kind": "group",
-                    "rotation": _num(a.get("rotation")), "pivotX": _num(a.get("pivotX")),
-                    "pivotY": _num(a.get("pivotY")), "scaleX": _num(a.get("scaleX"), 1.0),
-                    "scaleY": _num(a.get("scaleY"), 1.0), "translateX": _num(a.get("translateX")),
+                    "rotation": _num(a.get("rotation"), 0.0, -3600.0, 3600.0), "pivotX": _num(a.get("pivotX")),
+                    "pivotY": _num(a.get("pivotY")), "scaleX": _num(a.get("scaleX"), 1.0, -1e4, 1e4),
+                    "scaleY": _num(a.get("scaleY"), 1.0, -1e4, 1e4), "translateX": _num(a.get("translateX")),
                     "translateY": _num(a.get("translateY")),
                     "children": self.vector_children(ch, depth + 1) if depth < MAX_DEPTH * 4 else [],
                 })
@@ -1003,8 +1097,8 @@ class Resolver:
                     ops = parse_path_data(a.get("pathData", ""), min(MAX_PATH_OPS, remaining))
                 except PathTooLarge:
                     raise IconError("icon too complex") from None
-                except ValueError:
-                    continue
+                except (ValueError, ArithmeticError):
+                    continue  # malformed or numerically degenerate path: drop it
                 self._charge(0, len(ops))
                 d = [list(op) for op in ops]
                 if ch.name == "clip-path":
@@ -1016,18 +1110,19 @@ class Resolver:
                 stroke = self.paint(a.get("strokeColor"), depth + 1) if a.get("strokeColor") else None
                 out.append({
                     "kind": "path", "d": d, "fill": fill, "stroke": stroke,
-                    "fillAlpha": _num(a.get("fillAlpha"), 1.0),
-                    "strokeAlpha": _num(a.get("strokeAlpha"), 1.0),
-                    "strokeWidth": _num(a.get("strokeWidth"), 0.0),
+                    "fillAlpha": _num(a.get("fillAlpha"), 1.0, 0.0, 1.0),
+                    "strokeAlpha": _num(a.get("strokeAlpha"), 1.0, 0.0, 1.0),
+                    "strokeWidth": _num(a.get("strokeWidth"), 0.0, 0.0, 1e4),
                     "evenOdd": _enum(a.get("fillType"), {"nonZero": 0, "evenOdd": 1}, 0) == 1,
                     "cap": _enum(a.get("strokeLineCap"), {"butt": 0, "round": 1, "square": 2}, 0),
                     "join": _enum(a.get("strokeLineJoin"), {"miter": 0, "round": 1, "bevel": 2}, 0),
-                    "miter": _num(a.get("strokeMiterLimit"), 4.0),
+                    "miter": _num(a.get("strokeMiterLimit"), 4.0, 1.0, 1e3),
                 })
         return out
 
     def adaptive(self, node: XmlNode, depth: int) -> dict:
         layers = {}
+        self._charge(len(node.children))
         for ch in node.children:
             if ch.name in ("background", "foreground"):
                 layers[ch.name] = self._child_drawable(ch, ADAPTIVE_DP, depth)
@@ -1093,17 +1188,44 @@ def spec_from_resources(res: Resources, base_apk: Path, icon_path: str) -> dict 
 
 # ---------------------------------------------------------------- compose
 
-def ensure_compose() -> Path | None:
-    """Return the compose binary, building it with build.sh when missing or stale."""
+def _compose_fresh() -> bool:
     try:
-        fresh = COMPOSE_BIN.is_file() and COMPOSE_BIN.stat().st_mtime >= COMPOSE_SRC.stat().st_mtime
+        return COMPOSE_BIN.is_file() and COMPOSE_BIN.stat().st_mtime >= COMPOSE_SRC.stat().st_mtime
     except OSError:
-        fresh = False
-    if not fresh:
-        r = subprocess.run(["/bin/bash", str(BUILD_SCRIPT)], capture_output=True, text=True, timeout=600)
-        if r.returncode or not COMPOSE_BIN.is_file():
-            sys.stderr.write(r.stderr)
-            return None
+        return False
+
+
+def ensure_compose() -> Path | None:
+    """Return the compose binary, building it with build.sh when missing or stale.
+
+    Two installs may get here at once. The build runs under an exclusive lock
+    on build/.lock and build.sh links into a unique temporary name that is
+    renamed over the binary, so nobody ever executes a half written file.
+    """
+    if _compose_fresh():
+        return COMPOSE_BIN
+    import fcntl
+
+    COMPOSE_BIN.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(COMPOSE_BIN.parent / ".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        deadline = time.monotonic() + BUILD_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise IconError("timed out waiting for another compose build") from None
+                time.sleep(0.2)
+        if not _compose_fresh():  # another process may have built it while we waited
+            r = subprocess.run(["/bin/bash", str(BUILD_SCRIPT)], capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL, timeout=BUILD_TIMEOUT)
+            if r.returncode or not COMPOSE_BIN.is_file():
+                sys.stderr.write(r.stderr)
+                return None
+    finally:
+        os.close(fd)  # also releases the lock
     return COMPOSE_BIN
 
 
@@ -1111,34 +1233,52 @@ def render_spec(spec: dict, out_png: Path, size: int = 1024) -> bool:
     binary = ensure_compose()
     if not binary:
         return False
-    payload = json.dumps(dict(spec, size=size))
+    # allow_nan=False: NaN or Infinity would make the whole spec invalid JSON.
+    payload = json.dumps(dict(spec, size=size), allow_nan=False)
     if len(payload) > MAX_SPEC_BYTES:
         raise IconError("icon too complex")
     out_png.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
         spec_file = Path(tmp) / "spec.json"
-        spec_file.write_text(payload)
-        r = subprocess.run([str(binary), str(spec_file), str(out_png)], capture_output=True, text=True,
-                           timeout=COMPOSE_TIMEOUT)
+        spec_file.write_text(payload, encoding="ascii")
+        rendered = Path(tmp) / "icon.png"
+        r = subprocess.run([str(binary), str(spec_file), str(rendered)], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=COMPOSE_TIMEOUT)
         if r.returncode:
             sys.stderr.write(r.stderr)
             return False
-    return out_png.is_file() and out_png.stat().st_size > 0
+        data = rendered.read_bytes() if rendered.is_file() else b""
+        if bitmap_dimensions(data) != ("png", size, size):
+            return False
+        # Write next to the destination and rename, so a reader never sees a
+        # partial PNG and a failed render never clobbers an existing icon.
+        fd, part = tempfile.mkstemp(prefix=f".{out_png.name}.", suffix=".part", dir=out_png.parent)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.chmod(part, 0o644)
+            os.replace(part, out_png)
+        except BaseException:
+            Path(part).unlink(missing_ok=True)
+            raise
+    return True
 
 
 def extract_icon(apk_paths: list[Path], out_png: Path) -> bool:
     """Write a 1024x1024 macOS style PNG of the launcher icon; False on failure."""
-    apks = [Path(p) for p in apk_paths if Path(p).is_file()]
-    if not apks:
-        return False
     try:
+        apks = [Path(p) for p in apk_paths if Path(p).is_file()]
+        if not apks:
+            return False
         with tempfile.TemporaryDirectory() as tmp:
             spec = build_spec(apks, Path(tmp))
             if not spec:
                 return False
             return render_spec(spec, Path(out_png))
-    except (IconError, OSError, ValueError, zipfile.BadZipFile, subprocess.SubprocessError) as exc:
-        sys.stderr.write(f"iconkit: {exc}\n")
+    except Exception as exc:  # noqa: BLE001
+        # The APKs are untrusted: whatever they trigger, the caller gets False,
+        # never an exception (RecursionError and MemoryError included).
+        sys.stderr.write(f"iconkit: {type(exc).__name__}: {exc}\n")
         return False
 
 

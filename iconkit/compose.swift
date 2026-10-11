@@ -23,14 +23,38 @@ import UniformTypeIdentifiers
 
 typealias JSON = [String: Any]
 
+/// Largest magnitude accepted for any number in the spec; JSON allows 1e308,
+/// which would overflow to infinity as soon as it is scaled.
+let maxMagnitude: CGFloat = 1e7
+
+/// A finite number from the spec, clamped to +-maxMagnitude; `d` otherwise.
 func num(_ v: Any?, _ d: CGFloat = 0) -> CGFloat {
-    if let n = v as? NSNumber { return CGFloat(truncating: n) }
-    return d
+    guard let n = v as? NSNumber else { return d }
+    let x = CGFloat(truncating: n)
+    guard x.isFinite else { return d }
+    return min(max(x, -maxMagnitude), maxMagnitude)
+}
+
+/// Int(x) traps on NaN, infinity and values outside Int; this clamps instead.
+func clampedInt(_ x: CGFloat, _ lo: Int, _ hi: Int) -> Int {
+    guard x.isFinite else { return lo }
+    if x <= CGFloat(lo) { return lo }
+    if x >= CGFloat(hi) { return hi }
+    return Int(x)
+}
+
+func clamp(_ x: CGFloat, _ lo: CGFloat, _ hi: CGFloat) -> CGFloat {
+    return min(max(x, lo), hi)
+}
+
+func finite(_ r: CGRect) -> Bool {
+    return r.origin.x.isFinite && r.origin.y.isFinite && r.size.width.isFinite && r.size.height.isFinite
 }
 
 func rgba(_ v: Any?) -> CGColor? {
     guard let a = v as? [Any], a.count == 4 else { return nil }
-    return CGColor(srgbRed: num(a[0]) / 255, green: num(a[1]) / 255, blue: num(a[2]) / 255, alpha: num(a[3]) / 255)
+    func c(_ v: Any) -> CGFloat { clamp(num(v), 0, 255) / 255 }
+    return CGColor(srgbRed: c(a[0]), green: c(a[1]), blue: c(a[2]), alpha: c(a[3]))
 }
 
 let srgb = CGColorSpace(name: CGColorSpace.sRGB)!
@@ -114,7 +138,7 @@ func fillClip(_ ctx: CGContext, paint: JSON, alpha: CGFloat, unit: CGRect?) {
     var colors: [CGColor] = []
     var locs: [CGFloat] = []
     for s in stops where s.count == 2 {
-        if let c = rgba(s[1]) { colors.append(c.copy(alpha: c.alpha * alpha) ?? c); locs.append(num(s[0])) }
+        if let c = rgba(s[1]) { colors.append(c.copy(alpha: c.alpha * alpha) ?? c); locs.append(clamp(num(s[0]), 0, 1)) }
     }
     guard !colors.isEmpty else { return }
     if colors.count == 1 { colors.append(colors[0]); locs.append(1) }
@@ -149,10 +173,14 @@ func renderVectorChildren(_ ctx: CGContext, _ children: Any?, depth: Int = 0) {
             ctx.saveGState()
             let px = num(ch["pivotX"]), py = num(ch["pivotY"])
             ctx.translateBy(x: num(ch["translateX"]) + px, y: num(ch["translateY"]) + py)
-            ctx.rotate(by: num(ch["rotation"]) * .pi / 180)
+            ctx.rotate(by: clamp(num(ch["rotation"]), -3600, 3600) * .pi / 180)
             ctx.scaleBy(x: num(ch["scaleX"], 1), y: num(ch["scaleY"], 1))
             ctx.translateBy(x: -px, y: -py)
-            renderVectorChildren(ctx, ch["children"], depth: depth + 1)
+            // Nested scales multiply; once the transform stops being finite, skip the group.
+            let m = ctx.ctm
+            if [m.a, m.b, m.c, m.d, m.tx, m.ty].allSatisfy({ $0.isFinite }) {
+                renderVectorChildren(ctx, ch["children"], depth: depth + 1)
+            }
             ctx.restoreGState()
         case "clip":
             ctx.addPath(buildPath(ch["d"]))
@@ -169,9 +197,10 @@ func renderVectorChildren(_ ctx: CGContext, _ children: Any?, depth: Int = 0) {
             }
             let sw = num(ch["strokeWidth"])
             if let stroke = ch["stroke"] as? JSON, sw > 0 {
-                let cap: CGLineCap = [.butt, .round, .square][min(2, max(0, Int(num(ch["cap"]))))]
-                let join: CGLineJoin = [.miter, .round, .bevel][min(2, max(0, Int(num(ch["join"]))))]
-                let outline = path.copy(strokingWithWidth: sw, lineCap: cap, lineJoin: join, miterLimit: num(ch["miter"], 4))
+                let cap: CGLineCap = [.butt, .round, .square][clampedInt(num(ch["cap"]), 0, 2)]
+                let join: CGLineJoin = [.miter, .round, .bevel][clampedInt(num(ch["join"]), 0, 2)]
+                let outline = path.copy(strokingWithWidth: min(sw, 1e4), lineCap: cap, lineJoin: join,
+                                        miterLimit: clamp(num(ch["miter"], 4), 1, 1000))
                 ctx.saveGState()
                 ctx.addPath(outline)
                 ctx.clip()
@@ -185,11 +214,12 @@ func renderVectorChildren(_ ctx: CGContext, _ children: Any?, depth: Int = 0) {
 }
 
 func renderVector(_ ctx: CGContext, _ node: JSON, in rect: CGRect) {
+    // A tiny viewport would scale every coordinate up to infinity.
     let vw = num(node["vw"], 24), vh = num(node["vh"], 24)
-    guard vw > 0, vh > 0 else { return }
+    guard vw >= 0.001, vh >= 0.001 else { return }
     ctx.saveGState()
     ctx.clip(to: rect)
-    ctx.setAlpha(num(node["alpha"], 1))
+    ctx.setAlpha(clamp(num(node["alpha"], 1), 0, 1))
     ctx.beginTransparencyLayer(auxiliaryInfo: nil)
     ctx.saveGState()
     ctx.translateBy(x: rect.minX, y: rect.minY)
@@ -207,9 +237,19 @@ func renderVector(_ ctx: CGContext, _ node: JSON, in rect: CGRect) {
 
 // MARK: - Generic drawables
 
+var imageCache: [String: CGImage?] = [:]
+
 /// Decodes a bitmap only after its header proves it is a known format no larger
 /// than maxBitmapSide on either side; anything else is skipped (returns nil).
+/// Each file is decoded once, however many nodes reference it.
 func loadImage(_ path: String) -> CGImage? {
+    if let cached = imageCache[path] { return cached }
+    let img = decodeImage(path)
+    imageCache[path] = img
+    return img
+}
+
+func decodeImage(_ path: String) -> CGImage? {
     let noCache = [kCGImageSourceShouldCache: false] as CFDictionary
     guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, noCache),
           let type = CGImageSourceGetType(src) as String?, allowedImageTypes.contains(type),
@@ -235,7 +275,9 @@ func drawImage(_ ctx: CGContext, _ img: CGImage, in rect: CGRect) {
 }
 
 func render(_ ctx: CGContext, _ node: Any?, in rect: CGRect, depth: Int = 0) {
-    guard let n = node as? JSON, depth < 32, rect.width > 0, rect.height > 0, takeNode() else { return }
+    // CGRect.width is the standardized (absolute) width, so check the raw size too.
+    guard let n = node as? JSON, depth < 32, finite(rect), rect.size.width > 0, rect.size.height > 0,
+          takeNode() else { return }
     switch n["type"] as? String {
     case "color":
         if let c = rgba(n["color"]) { ctx.setFillColor(c); ctx.fill(rect) }
@@ -245,7 +287,7 @@ func render(_ ctx: CGContext, _ node: Any?, in rect: CGRect, depth: Int = 0) {
         renderVector(ctx, n, in: rect)
     case "layers":
         for item in n["items"] as? [JSON] ?? [] {
-            let ins = (item["inset"] as? [Any] ?? []).map { num($0) }
+            let ins = (item["inset"] as? [Any] ?? []).prefix(4).map { clamp(num($0), -2, 2) }
             let l = ins.count > 0 ? ins[0] : 0, t = ins.count > 1 ? ins[1] : 0
             let r = ins.count > 2 ? ins[2] : 0, b = ins.count > 3 ? ins[3] : 0
             let sub = CGRect(x: rect.minX + l * rect.width, y: rect.minY + t * rect.height,
@@ -257,7 +299,7 @@ func render(_ ctx: CGContext, _ node: Any?, in rect: CGRect, depth: Int = 0) {
         if n["shape"] as? String == "oval" {
             path = CGPath(ellipseIn: rect, transform: nil)
         } else {
-            let rad = min(num(n["radius"]) * min(rect.width, rect.height), min(rect.width, rect.height) / 2)
+            let rad = clamp(num(n["radius"]) * min(rect.width, rect.height), 0, min(rect.width, rect.height) / 2)
             path = CGPath(roundedRect: rect, cornerWidth: rad, cornerHeight: rad, transform: nil)
         }
         if let fill = n["fill"] as? JSON {
@@ -265,7 +307,7 @@ func render(_ ctx: CGContext, _ node: Any?, in rect: CGRect, depth: Int = 0) {
             fillClip(ctx, paint: fill, alpha: 1, unit: rect)
             ctx.restoreGState()
         }
-        let sw = num(n["strokeWidth"]) * min(rect.width, rect.height)
+        let sw = clamp(num(n["strokeWidth"]), 0, 2) * min(rect.width, rect.height)
         if let stroke = n["stroke"] as? JSON, sw > 0 {
             ctx.saveGState()
             ctx.addPath(path.copy(strokingWithWidth: sw, lineCap: .butt, lineJoin: .miter, miterLimit: 4))
@@ -312,7 +354,7 @@ guard let data = FileManager.default.contents(atPath: args[1]), data.count <= ma
     exit(1)
 }
 
-let size = max(16, min(4096, Int(num(spec["size"], 1024))))
+let size = clampedInt(num(spec["size"], 1024), 16, 4096)
 let S = CGFloat(size)
 guard let ctx = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0, space: srgb,
                           bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { exit(1) }

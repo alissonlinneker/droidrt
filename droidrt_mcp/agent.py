@@ -242,10 +242,18 @@ class AgentClient:
                 pass
         self._file = self._sock = None
 
-    def close(self) -> None:
-        with self._lock:
-            self._close()
+    def close(self, timeout: float | None = None) -> None:
+        """Close the connection and remove the adb forward. With `timeout`, a call
+        still in progress is waited for at most that long; after it the forward
+        is removed anyway (shutdown must not hang on a slow command)."""
+        locked = self._lock.acquire(timeout=-1 if timeout is None else timeout)
+        try:
+            if locked:
+                self._close()
             self._remove_forward()
+        finally:
+            if locked:
+                self._lock.release()
 
     def _open(self) -> None:
         if self.fixed_address:
@@ -374,6 +382,8 @@ class AgentClient:
                 resp = json.loads(raw)
             except json.JSONDecodeError:
                 raise DeviceError("agent sent invalid JSON") from None
+            if not isinstance(resp, dict):
+                raise DeviceError("agent sent a response that is not an object")
             if resp.get("id") != req_id:
                 continue  # a late answer to an abandoned request
             if resp.get("ok"):

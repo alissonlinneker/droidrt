@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-11
+
+### Added
+
+- `DROIDRT_RESIZABLE=1` opens resizable windows that resize the Android display (scrcpy flex display with a point sized display spec).
+- `record_flow` takes `overwrite` (default `false`) and writes flows atomically.
+- Support section and GitHub Sponsors link.
+
+### Fixed
+
+- Concurrent launches no longer boot two VMs, and `idle-stop` no longer powers the VM off during another launch (file locks for boot, busy windows and per package launches).
+- Quitting a launcher during boot no longer leaves an orphan window or a VM that never stops.
+- A launcher name taken by an app that droidrt did not create is never overwritten; bundles are built in staging and moved into place.
+- `sync` no longer removes every launcher when the package manager returns a short list right after boot, and `uninstall` keeps the launcher when the uninstall fails.
+- Switching images downloads the new image before recreating the AVD; every subprocess has a timeout.
+- iconkit resolves resource references written by name (`@color/name`), so adaptive icon backgrounds render again (Organic Maps, Fennec), and it never raises on malformed input.
+- The icon compositor no longer crashes on out of range or non finite numbers.
+- MCP: `notifications/cancelled` is honored, duplicate in flight ids are rejected, shutdown no longer waits for slow calls or leaves scrcpy sessions and adb forwards behind, and semantic reloads no longer race each other.
+- The on-device agent survives unexpected errors in a connection and recovers its accept loop.
+
+### Security
+
+- MCP: element ids are checked against the windows of the requested package, so a guessed id cannot act on a blocked app; `press_key` is refused when the app has no droidrt display.
+- Generated `open_url` tools take an address and always use `https://`; intent templates only accept placeholders in `data` and extras, after a literal safe scheme.
+- Package names from untrusted manifests are validated before they reach file paths or `adb shell`.
+- The on-device agent caps pending handshakes (8) and connections (32), applies a total 10 s handshake deadline and limits the auth line to 4 KiB.
+- iconkit caps extracted bitmaps, XML dumps and aapt2 output size, and builds its compositor atomically under a lock.
+
 ## [0.1.0] - 2026-10-11
 
 First public release.
@@ -39,5 +67,6 @@ First public release.
 - Size limits when unpacking bundles (4 GiB in total, 2 GiB per entry), path traversal checks, icon size and pixel limits, and depth and node budgets in `iconkit`.
 - No `shell=True` anywhere; every subprocess receives an argument list.
 
-[Unreleased]: https://github.com/alissonlinneker/droidrt/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/alissonlinneker/droidrt/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/alissonlinneker/droidrt/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/alissonlinneker/droidrt/releases/tag/v0.1.0

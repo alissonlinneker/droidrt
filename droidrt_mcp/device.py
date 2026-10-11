@@ -44,10 +44,23 @@ def png_size(data: bytes) -> tuple[int, int]:
 
 
 def parse_logical_displays(dumpsys: str) -> dict[int, str]:
-    """Map logical display ids to the unique id of their display device."""
-    out = {}
-    for m in re.finditer(r"^\s*mDisplayId=(\d+)\s*\n\s*mPrimaryDisplayDevice=.*\(([^()\s]+)\)\s*$", dumpsys, re.M):
-        out[int(m.group(1))] = m.group(2)
+    """Map logical display ids to the unique id of their display device.
+
+    Each logical display block starts with mDisplayId=; mPrimaryDisplayDevice=
+    follows later in the same block, with other fields (mIsEnabled,
+    mLayerStack...) in between on most Android versions."""
+    out: dict[int, str] = {}
+    current: int | None = None
+    for line in dumpsys.splitlines():
+        line = line.strip()
+        m = re.fullmatch(r"mDisplayId=(\d+)", line)
+        if m:
+            current = int(m.group(1))
+            continue
+        m = re.fullmatch(r"mPrimaryDisplayDevice=.*\(([^()\s]+)\)", line)
+        if m and current is not None:
+            out.setdefault(current, m.group(1))
+            current = None
     return out
 
 
@@ -171,6 +184,10 @@ class DeviceManager:
         self.labels = labels or (lambda: {})
         self.sessions: dict[str, dict] = {}
         self.lock = threading.RLock()
+        # Every headless scrcpy started here, including one still waiting for its
+        # display, so shutdown can stop it even before it becomes a session.
+        self._spawned: set[subprocess.Popen] = set()
+        self._closing = False
         self._load_sessions()
 
     # ------------------------------------------------------------ VM
@@ -208,28 +225,41 @@ class DeviceManager:
                 self.sessions[pkg] = {"pid": s["pid"], "displayId": s["displayId"], "adopted": True}
         self._save_sessions()
 
-    def _save_sessions(self) -> None:
+    def _save_sessions(self, locked: bool = True) -> None:
+        """Write the session state. `locked=False` is for shutdown, which may not
+        own the lock and must not wait for it."""
         if not self.state_file:
             return
+        if locked:
+            with self.lock:
+                data = json.dumps({k: {"pid": v["pid"], "displayId": v["displayId"]}
+                                   for k, v in self.sessions.items()})
+        else:
+            data = json.dumps({k: {"pid": v["pid"], "displayId": v["displayId"]}
+                               for k, v in list(self.sessions.items())})
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            self.state_file.write_text(json.dumps(
-                {k: {"pid": v["pid"], "displayId": v["displayId"]} for k, v in self.sessions.items()}))
+            self.state_file.write_text(data)
         except OSError as e:
             log.warning("cannot save session state: %s", e)
 
     def _session_alive(self, pkg: str) -> dict | None:
-        s = self.sessions.get(pkg)
-        if not s:
-            return None
-        proc = s.get("proc")
-        if proc is not None and proc.poll() is not None:
-            self.sessions.pop(pkg, None)
-            self._save_sessions()
-            return None
+        # The sessions dict is shared with the background semantic reload
+        # (list_apps) and with shutdown, so it is only touched under the lock.
+        with self.lock:
+            s = self.sessions.get(pkg)
+            if not s:
+                return None
+            proc = s.get("proc")
+            if proc is not None and proc.poll() is not None:
+                self.sessions.pop(pkg, None)
+                self._save_sessions()
+                return None
         if proc is None and not any(p["pid"] == s["pid"] for p in self.scrcpy_processes()):
-            self.sessions.pop(pkg, None)
-            self._save_sessions()
+            with self.lock:
+                if self.sessions.get(pkg) is s:
+                    self.sessions.pop(pkg, None)
+                    self._save_sessions()
             return None
         return s
 
@@ -313,37 +343,57 @@ class DeviceManager:
         if re.search(r"^Error|Exception", out, re.M):
             raise DeviceError(f"cannot start {comp} on display {display}: {out.strip()[-300:]}")
 
+    def _check_open(self) -> None:
+        if self._closing:
+            raise DeviceError("the server is shutting down")
+
     def _start_headless(self, pkg: str) -> int:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         log_path = self.log_dir / f"mcp-{pkg}.log"
         last = ""
         for attempt in range(3):
+            self._check_open()
             with open(log_path, "wb") as out:
                 proc = subprocess.Popen(self.headless_argv(pkg), stdin=subprocess.DEVNULL, stdout=out,
                                         stderr=subprocess.STDOUT, start_new_session=True)
-            deadline = time.monotonic() + 40
-            display = None
-            while time.monotonic() < deadline and proc.poll() is None:
-                last = log_path.read_text(errors="replace")
-                m = NEW_DISPLAY_RE.search(last)
-                if m:
-                    display = int(m.group(1))
-                    break
-                time.sleep(0.25)
-            if display is not None:
-                self.sessions[pkg] = {"pid": proc.pid, "displayId": display, "proc": proc}
-                self._save_sessions()
-                try:
-                    self.launch_on(pkg, display)
-                except Exception:
-                    self.sessions.pop(pkg, None)
+            with self.lock:
+                self._spawned.add(proc)
+            registered = False
+            try:
+                deadline = time.monotonic() + 40
+                display = None
+                while time.monotonic() < deadline and proc.poll() is None and not self._closing:
+                    last = log_path.read_text(errors="replace")
+                    m = NEW_DISPLAY_RE.search(last)
+                    if m:
+                        display = int(m.group(1))
+                        break
+                    time.sleep(0.25)
+                self._check_open()
+                if display is not None:
+                    with self.lock:
+                        self.sessions[pkg] = {"pid": proc.pid, "displayId": display, "proc": proc}
                     self._save_sessions()
+                    try:
+                        self.launch_on(pkg, display)
+                        self._check_open()
+                    except BaseException:
+                        with self.lock:
+                            if self.sessions.get(pkg, {}).get("proc") is proc:
+                                self.sessions.pop(pkg, None)
+                        self._save_sessions()
+                        raise
+                    registered = True
+                    self._wait_app_on(pkg, display, 15)
+                    log.info("headless session for %s on display %d (pid %d)", pkg, display, proc.pid)
+                    return display
+            finally:
+                if not registered:
+                    # Any failure (or shutdown) while starting: never leave the
+                    # scrcpy process, which runs in its own session, behind.
                     self._terminate(proc.pid, proc)
-                    raise
-                self._wait_app_on(pkg, display, 15)
-                log.info("headless session for %s on display %d (pid %d)", pkg, display, proc.pid)
-                return display
-            self._terminate(proc.pid, proc)
+                    with self.lock:
+                        self._spawned.discard(proc)
             log.info("headless scrcpy failed to start (attempt %d)", attempt + 1)
             time.sleep(1)
         raise DeviceError(f"could not create a headless display for {pkg}: {last.strip()[-400:]}")
@@ -388,6 +438,8 @@ class DeviceManager:
             s = self.sessions.pop(pkg, None)
             if s:
                 self._terminate(s["pid"], s.get("proc"))
+                if s.get("proc") is not None:
+                    self._spawned.discard(s["proc"])
                 closed.append({"pid": s["pid"], "kind": "headless"})
                 self._save_sessions()
             for p in self.scrcpy_processes():
@@ -396,15 +448,27 @@ class DeviceManager:
                     closed.append({"pid": p["pid"], "kind": "headless" if p["headless"] else "window"})
             return {"package": pkg, "closed": closed}
 
-    def shutdown(self) -> None:
-        """Stop the headless sessions started by this server process."""
-        with self.lock:
+    def shutdown(self, lock_timeout: float = 5) -> None:
+        """Stop the headless sessions started by this server process, including
+        one still being started by a tool call that is in progress. Never waits
+        long for that call: the client may kill the process soon after."""
+        self._closing = True
+        locked = self.lock.acquire(timeout=lock_timeout)
+        try:
+            procs = set(self._spawned) | {s["proc"] for s in list(self.sessions.values())
+                                          if s.get("proc") is not None}
+            for proc in procs:
+                if proc.poll() is None:
+                    self._terminate(proc.pid, proc)
             for pkg, s in list(self.sessions.items()):
                 if s.get("proc") is not None:
-                    self._terminate(s["pid"], s["proc"])
                     self.sessions.pop(pkg, None)
-            self._save_sessions()
-        self.agent.close()
+            self._spawned.clear()
+            self._save_sessions(locked=False)
+        finally:
+            if locked:
+                self.lock.release()
+        self.agent.close(timeout=lock_timeout)
 
     # ------------------------------------------------------------ screen
 
@@ -455,8 +519,29 @@ class DeviceManager:
 
     # ------------------------------------------------------------ actions
 
+    def check_node_owner(self, pkg: str, node_id: str) -> None:
+        """An element id names a window and a child path ("w12:0.3"), and window
+        ids are small numbers that are easy to guess. Before acting on an id
+        given by the client, make sure its window belongs to `pkg`, so an
+        allowed package can never be used to tap or type into another app."""
+        window = node_id.split(":", 1)[0] + ":"
+        for root in self.tree(pkg, 0):
+            rid = root.get("id")
+            if isinstance(rid, str) and rid.startswith(window) and root.get("pkg") in (None, pkg):
+                return
+        raise ToolInputError(f"element {node_id} is not on a window of {pkg}; call get_screen again")
+
+    def _node_action(self, node_id: str, args: dict) -> Any:
+        try:
+            return self.agent.call("action", {"nodeId": node_id, **args}, timeout=10)
+        except AgentError as e:
+            if "stale" in str(e):
+                raise ToolInputError(f"element {node_id} is stale (the screen changed); "
+                                     "call get_screen or find_elements again") from None
+            raise
+
     def click_node(self, node_id: str) -> dict:
-        res = self.agent.call("action", {"nodeId": node_id, "action": "click"}, timeout=10)
+        res = self._node_action(node_id, {"action": "click"})
         self.idle()
         return res if isinstance(res, dict) else {"performed": bool(res)}
 
@@ -486,7 +571,7 @@ class DeviceManager:
                 raise ToolInputError(f"no element matches {json.dumps(selector, ensure_ascii=False)}")
             try:
                 res = self.click_node(node["id"])
-            except AgentError as e:
+            except ToolInputError as e:
                 if "stale" in str(e) and attempt == 1:
                     continue
                 raise
@@ -502,11 +587,11 @@ class DeviceManager:
         return (focused or nodes or [None])[0]
 
     def set_text(self, node_id: str, text: str, submit: bool = False) -> dict:
-        res = self.agent.call("action", {"nodeId": node_id, "action": "set_text", "text": text}, timeout=10)
+        res = self._node_action(node_id, {"action": "set_text", "text": text})
         out = {"element": node_id, "performed": bool(res.get("performed") if isinstance(res, dict) else res)}
         if submit:
             self.idle(1500)
-            sub = self.agent.call("action", {"nodeId": node_id, "action": "ime_enter"}, timeout=10)
+            sub = self._node_action(node_id, {"action": "ime_enter"})
             out["submitted"] = bool(sub.get("performed") if isinstance(sub, dict) else sub)
         self.idle()
         return out
@@ -556,13 +641,16 @@ class DeviceManager:
         another app. The agent's global action is the fallback."""
         self.idle()
         display = self.display_for(pkg)
-        if display is not None:
-            out = self.adb.shell("input", "-d", str(display), "keyevent", KEYCODES[key], timeout=10, check=False)
-            if "Error" not in out and "Exception" not in out:
-                self.idle()
-                return {"displayId": display, "key": key, "performed": True}
-        if key == "enter":
+        if display is None:
+            # The global action would go to whatever app has focus, possibly a
+            # blocked one, so without a display of its own the key is refused.
             raise ToolInputError(f"{pkg} has no open window; call open_app first")
+        out = self.adb.shell("input", "-d", str(display), "keyevent", KEYCODES[key], timeout=10, check=False)
+        if "Error" not in out and "Exception" not in out:
+            self.idle()
+            return {"displayId": display, "key": key, "performed": True}
+        if key == "enter":
+            raise DeviceError(f"cannot send enter to display {display}: {out.strip()[-200:]}")
         res = self.agent.call("global", {"action": key}, timeout=10)
         self.idle()
         return {"key": key, **(res if isinstance(res, dict) else {"performed": bool(res)})}

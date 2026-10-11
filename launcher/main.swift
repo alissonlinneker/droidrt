@@ -107,7 +107,9 @@ final class LauncherLog {
     init(package: String) {
         let dir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Logs/droidrt", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Logs carry command lines and app names: keep them private like droidrt.py does.
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
         let file = dir.appendingPathComponent("\(package).launcher.log")
         if !FileManager.default.fileExists(atPath: file.path) {
             FileManager.default.createFile(atPath: file.path, contents: nil)
@@ -174,6 +176,13 @@ final class LauncherDelegate: NSObject, NSApplicationDelegate {
         if !pendingTerminateReply {
             pendingTerminateReply = true
             stopChild()
+            // A child that ignores SIGTERM must not leave the app stuck in "quitting" forever.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
+                guard let self, self.pendingTerminateReply else { return }
+                self.log.write("child still running after 20 s, quitting anyway")
+                self.pendingTerminateReply = false
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
         }
         return .terminateLater
     }
@@ -277,7 +286,10 @@ final class LauncherDelegate: NSObject, NSApplicationDelegate {
     // MARK: Window activation
 
     private func startPolling(for seconds: TimeInterval) {
-        pollDeadline = Date().addingTimeInterval(seconds)
+        // Never shorten a running poll: a Dock click during a cold boot asks for 60 s
+        // while the boot itself was given 180 s.
+        let deadline = Date().addingTimeInterval(seconds)
+        if pollTimer == nil || deadline > pollDeadline { pollDeadline = deadline }
         guard pollTimer == nil else { return }
         let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -344,7 +356,10 @@ final class LauncherDelegate: NSObject, NSApplicationDelegate {
 // MARK: - Entry point
 
 let info = Bundle.main.infoDictionary ?? [:]
-let package = info["DroidrtPackage"] as? String ?? ""
+// The package name ends up in a log file path: accept only Android package names.
+let package = (info["DroidrtPackage"] as? String).flatMap {
+    $0.range(of: "^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z0-9_]+)*$", options: .regularExpression) != nil ? $0 : nil
+} ?? ""
 let title = (info["CFBundleName"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? package
 let command = info["DroidrtCommand"] as? [String] ?? []
 let launcherLog = LauncherLog(package: package.isEmpty ? "unknown" : package)

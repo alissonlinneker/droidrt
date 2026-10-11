@@ -12,7 +12,9 @@ device layer, so no value ever reaches a shell unquoted.
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import time
 import urllib.parse
 from pathlib import Path
@@ -249,8 +251,9 @@ def check_flow_scope(package: str, steps: Any) -> None:
 
 
 def save_flow(package: str, name: str, description: str, steps: list, input_schema: dict | None = None,
-              base: Path | None = None) -> Path:
-    """Write a recorded flow in the short form understood by semantic.flows."""
+              base: Path | None = None, overwrite: bool = False) -> Path:
+    """Write a recorded flow in the short form understood by semantic.flows.
+    An existing flow is only replaced when `overwrite` is true."""
     validate.package({"package": package})
     if not isinstance(name, str) or not validate.FLOW_NAME_RE.fullmatch(name):
         raise ToolInputError("name must match ^[a-z][a-z0-9_]{0,47}$")
@@ -276,9 +279,31 @@ def save_flow(package: str, name: str, description: str, steps: list, input_sche
     path = folder / f"{name}.json"
     if path.is_symlink():
         raise ToolInputError("refusing to overwrite a symlink")
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(raw + "\n", encoding="utf-8")
-    tmp.replace(path)
+    if path.exists() and not overwrite:
+        raise ToolInputError(f"a flow named {name} already exists for {package}; pass overwrite=true to replace it")
+    # A fresh temp file created with O_EXCL: a leftover or planted file (or
+    # symlink) with a predictable name is never written through.
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{name}.", suffix=".tmp", dir=folder)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(raw + "\n")
+        if not overwrite:
+            # Atomic "create only": link fails when the name appeared meanwhile.
+            try:
+                os.link(tmp, path)
+            except FileExistsError:
+                raise ToolInputError(f"a flow named {name} already exists for {package}; "
+                                     "pass overwrite=true to replace it") from None
+            tmp.unlink()
+        else:
+            os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
     return path
 
 

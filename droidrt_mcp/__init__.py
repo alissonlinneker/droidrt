@@ -7,4 +7,4 @@ per-app semantic tools from the `semantic` package and recorded flows.
 Run it with `python3 -m droidrt_mcp`.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

@@ -114,13 +114,24 @@ final class Nodes {
         if (!"0".equals(path[0])) {
             throw new AgentException("invalid nodeId: " + nodeId);
         }
-        AccessibilityWindowInfo window = findWindow(svc, Integer.parseInt(m.group(1)));
+        int windowId;
+        int[] indexes = new int[path.length];
+        try {
+            windowId = Integer.parseInt(m.group(1));
+            for (int i = 1; i < path.length; i++) {
+                indexes[i] = Integer.parseInt(path[i]);
+            }
+        } catch (NumberFormatException e) {
+            // Digits that overflow an int cannot name a real window or child.
+            throw new AgentException("invalid nodeId: " + nodeId);
+        }
+        AccessibilityWindowInfo window = findWindow(svc, windowId);
         if (window == null) {
             throw new AgentException("stale node");
         }
         AccessibilityNodeInfo node = window.getRoot();
         for (int i = 1; i < path.length && node != null; i++) {
-            int index = Integer.parseInt(path[i]);
+            int index = indexes[i];
             node = index < node.getChildCount() ? node.getChild(index) : null;
         }
         if (node == null || !node.refresh()) {

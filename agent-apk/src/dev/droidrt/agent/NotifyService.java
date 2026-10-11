@@ -44,12 +44,37 @@ public final class NotifyService extends NotificationListenerService {
     }
 
     @Override
+    public void onDestroy() {
+        instance = null;
+        super.onDestroy();
+    }
+
+    @Override
     public void onNotificationPosted(StatusBarNotification sbn) {
+        dropImages(sbn);
         synchronized (RING) {
             if (RING.size() >= RING_SIZE) {
                 RING.removeFirst();
             }
             RING.addLast(sbn);
+        }
+    }
+
+    /**
+     * The ring buffer only needs texts and actions. Big pictures and large
+     * icons can be megabytes each, and 200 of them would otherwise stay
+     * referenced for the life of the process.
+     */
+    private static void dropImages(StatusBarNotification sbn) {
+        Bundle extras = sbn.getNotification().extras;
+        if (extras == null) {
+            return;
+        }
+        extras.remove(Notification.EXTRA_PICTURE);
+        extras.remove(Notification.EXTRA_LARGE_ICON);
+        extras.remove(Notification.EXTRA_LARGE_ICON_BIG);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            extras.remove(Notification.EXTRA_PICTURE_ICON);
         }
     }
 

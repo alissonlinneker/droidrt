@@ -172,12 +172,15 @@ class Tools:
             Tool("record_flow", "Save a reusable flow for an app and expose it as a new tool named "
                  "<app>_<name>. Steps follow the droidrt flow format: open_app, intent, wait, tap, type, press, "
                  "swipe, sleep; strings may use {arg} placeholders with the filters |urlencode and |digits, and "
-                 "every placeholder becomes a string argument of the new tool.",
+                 "every placeholder becomes a string argument of the new tool. An existing flow with the same "
+                 "name is only replaced with overwrite=true.",
                  schema({"package": PKG, "name": {"type": "string", "pattern": validate.FLOW_NAME_RE.pattern},
                          "description": {"type": "string", "maxLength": 1024},
                          "steps": {"type": "array", "items": {"type": "object"}, "minItems": 1,
                                    "maxItems": flows.MAX_STEPS},
-                         "input_schema": {"type": "object"}}, ["package", "name", "description", "steps"]),
+                         "input_schema": {"type": "object"},
+                         "overwrite": {"type": "boolean", "default": False}},
+                        ["package", "name", "description", "steps"]),
                  self.record_flow, "Record flow",
                  a("Record flow", {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True,
                                    "openWorldHint": False})),
@@ -288,6 +291,7 @@ class Tools:
         if chosen != 1:
             raise ToolInputError("give exactly one of element_id, text, resource_id or x and y")
         if nid:
+            self.device.check_node_owner(pkg, nid)
             return {"element": nid, **self.device.click_node(nid)}
         if has_xy:
             x = validate.integer(args, "x", None, 0, 100000)
@@ -314,6 +318,8 @@ class Tools:
             if node is None:
                 raise ToolInputError(f"{pkg} has no editable field on screen")
             nid = node["id"]
+        else:
+            self.device.check_node_owner(pkg, nid)
         return self.device.set_text(nid, text, submit)
 
     def swipe(self, args: dict) -> Any:
@@ -347,11 +353,13 @@ class Tools:
         validate.no_unknown(args, {"key", "text"})
         key = validate.string(args, "key", max_len=validate.NOTIFICATION_KEY_MAX, single_line=True)
         text = validate.string(args, "text")
-        items = self.device.agent.call("notifications", {}, timeout=10) or []
+        items = self.device.agent.call("notifications", {}, timeout=10)
+        items = items if isinstance(items, list) else []
         note = next((n for n in items if isinstance(n, dict) and n.get("key") == key), None)
         if note is None or not validate.package_allowed(note.get("package")):
             raise ToolInputError("no notification with that key")
-        action = next((a for a in note.get("actions") or [] if isinstance(a, dict) and a.get("remoteInput")), None)
+        action = next((a for a in note.get("actions") or [] if isinstance(a, dict) and a.get("remoteInput")
+                       and isinstance(a.get("index"), int) and not isinstance(a.get("index"), bool)), None)
         if action is None:
             raise ToolInputError("that notification has no reply action")
         res = self.device.agent.call("notification_action", {"key": key, "index": action["index"], "text": text},
@@ -368,13 +376,14 @@ class Tools:
         return self.device.start_intent(pkg, spec)
 
     def record_flow(self, args: dict) -> Any:
-        validate.no_unknown(args, {"package", "name", "description", "steps", "input_schema"})
+        validate.no_unknown(args, {"package", "name", "description", "steps", "input_schema", "overwrite"})
         pkg = validate.package(args)
+        overwrite = validate.boolean(args, "overwrite", False)
         input_schema = args.get("input_schema")
         if input_schema is not None and not isinstance(input_schema, dict):
             raise ToolInputError("input_schema must be an object")
         path = flows.save_flow(pkg, args.get("name"), args.get("description"), args.get("steps"),
-                               input_schema, base=self.flows_base)
+                               input_schema, base=self.flows_base, overwrite=overwrite)
         self.on_flows_changed(pkg)
         names = [n for n, d in self.semantic.items() if d.get("package") == pkg]
         # Relative to the flows folder: the absolute path would expose the user's home.

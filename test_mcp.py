@@ -14,6 +14,7 @@ import io
 import json
 import logging
 import os
+import queue
 import secrets
 import socket
 import socketserver
@@ -23,6 +24,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -38,6 +40,13 @@ from droidrt_mcp.tools import MAX_NOTIFICATION_FIELD, MAX_NOTIFICATIONS, Tools, 
 ROOT = Path(__file__).resolve().parent
 logging.disable(logging.CRITICAL)
 TEST_KEY = "ab" * 32
+def zip_bytes() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("AndroidManifest.xml", b"x")
+    return buf.getvalue()
+
+
 PNG_1x1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
 
@@ -138,7 +147,7 @@ class FakeAgent(socketserver.ThreadingTCPServer):
                 out.append(n)
             return out
         if cmd == "action":
-            if args["nodeId"] == "w9:9":
+            if args["nodeId"] in ("w9:9", "w5:9"):
                 raise AgentError("stale node")
             if args["action"] == "set_text":
                 self.text = args["text"]
@@ -597,7 +606,7 @@ class ApkCacheTest(unittest.TestCase):
             def run(self, *args, timeout=30, check=True, binary=False, input_data=None):
                 self.calls.append(args)
                 if args[0] == "pull":
-                    Path(args[2]).write_bytes(b"PK")
+                    Path(args[2]).write_bytes(zip_bytes())
                 return ""
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1152,6 +1161,585 @@ def _handler_with_proof(proof):
         self.wfile.flush()
         self.rfile.readline()
     return handle
+
+
+# ---------------------------------------------------------------- review fixes
+
+class BlockingInput(io.TextIOBase):
+    """A stdin whose lines are fed by the test; readline blocks until one comes."""
+
+    def __init__(self):
+        self.lines: "queue.Queue[str]" = queue.Queue()
+
+    def feed(self, msg):
+        self.lines.put(json.dumps(msg) + "\n")
+
+    def close_input(self):
+        self.lines.put("")
+
+    def readline(self, size=-1):
+        return self.lines.get(timeout=30)
+
+
+class LockedOutput(io.TextIOBase):
+    def __init__(self):
+        self.buf = io.StringIO()
+        self.lock = threading.Lock()
+
+    def write(self, s):
+        with self.lock:
+            return self.buf.write(s)
+
+    def flush(self):
+        pass
+
+    def messages(self):
+        with self.lock:
+            return [json.loads(l) for l in self.buf.getvalue().splitlines()]
+
+
+class CancellationTest(unittest.TestCase):
+    def setUp(self):
+        self.server = McpServer("droidrt", "0")
+        self.release = threading.Event()
+        self.started = threading.Event()
+        self.ran: list[str] = []
+
+        def slow(args):
+            self.started.set()
+            self.release.wait(10)
+            self.ran.append(args.get("tag", ""))
+            return "slow done"
+
+        self.server.set_tools([Tool("slow", "s", {"type": "object"}, slow),
+                               Tool("echo", "e", {"type": "object"}, lambda a: "ok")])
+        self.stdin = BlockingInput()
+        self.out = LockedOutput()
+        self.thread = threading.Thread(target=self.server.serve, args=(self.stdin, self.out), daemon=True)
+        self.thread.start()
+        self.stdin.feed(rpc(1, "initialize", init_params()))
+        self.stdin.feed({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def tearDown(self):
+        self.release.set()
+        self.stdin.close_input()
+        self.thread.join(15)
+
+    def wait_for_id(self, i, timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for m in self.out.messages():
+                if m.get("id") == i:
+                    return m
+            time.sleep(0.01)
+        return None
+
+    def test_cancelled_request_gets_no_response(self):
+        self.stdin.feed(rpc(2, "tools/call", {"name": "slow", "arguments": {"tag": "a"}}))
+        self.assertTrue(self.started.wait(5))
+        self.stdin.feed({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                         "params": {"requestId": 2, "reason": "user"}})
+        self.stdin.feed(rpc(3, "ping"))
+        self.assertIsNotNone(self.wait_for_id(3))
+        self.release.set()
+        self.stdin.feed(rpc(4, "tools/call", {"name": "echo"}))
+        self.assertIsNotNone(self.wait_for_id(4))
+        time.sleep(0.2)
+        self.assertIsNone(self.wait_for_id(2, timeout=0.2))
+        self.assertEqual(self.server._pending, 0)
+        self.assertEqual(self.server._inflight, {})
+
+    def test_queued_request_cancelled_before_it_runs(self):
+        self.server.workers = 1  # irrelevant once serving; use the busy single slow call instead
+        self.stdin.feed(rpc(2, "tools/call", {"name": "slow", "arguments": {"tag": "first"}}))
+        self.assertTrue(self.started.wait(5))
+        # Fill the remaining workers so request 9 has to wait in the queue.
+        for i in range(10, 13):
+            self.stdin.feed(rpc(i, "tools/call", {"name": "slow", "arguments": {"tag": str(i)}}))
+        self.stdin.feed(rpc(9, "tools/call", {"name": "slow", "arguments": {"tag": "queued"}}))
+        self.stdin.feed({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 9}})
+        self.stdin.feed(rpc(3, "ping"))
+        self.assertIsNotNone(self.wait_for_id(3))
+        self.release.set()
+        for i in (2, 10, 11, 12):
+            self.assertIsNotNone(self.wait_for_id(i), i)
+        time.sleep(0.2)
+        self.assertNotIn("queued", self.ran)
+        self.assertIsNone(self.wait_for_id(9, timeout=0.2))
+
+    def test_duplicate_id_in_progress_is_rejected(self):
+        self.stdin.feed(rpc(2, "tools/call", {"name": "slow", "arguments": {"tag": "a"}}))
+        self.assertTrue(self.started.wait(5))
+        self.stdin.feed(rpc(2, "tools/call", {"name": "slow", "arguments": {"tag": "b"}}))
+        dup = self.wait_for_id(2)
+        self.assertEqual(dup["error"]["code"], INVALID_REQUEST)
+        self.assertIn("already used", dup["error"]["message"])
+        self.release.set()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and len([m for m in self.out.messages() if m.get("id") == 2]) < 2:
+            time.sleep(0.01)
+        answers = [m for m in self.out.messages() if m.get("id") == 2]
+        self.assertEqual(answers[1]["result"]["content"][0]["text"], "slow done")
+        self.assertEqual(self.ran, ["a"])
+        # The id is free again once the first request finished.
+        self.stdin.feed(rpc("2", "tools/call", {"name": "echo"}))  # "2" and 2 are different ids
+        self.assertIsNotNone(self.wait_for_id("2"))
+
+    def test_cancel_ignores_unknown_ids(self):
+        self.assertFalse(self.server.cancel(12345))
+        self.assertFalse(self.server.cancel(None))
+        self.assertFalse(self.server.cancel(True))
+
+
+class ProtocolShutdownTest(unittest.TestCase):
+    def test_broken_stdout_does_not_raise(self):
+        class Broken(io.TextIOBase):
+            def write(self, s):
+                raise BrokenPipeError("gone")
+
+        server = McpServer("droidrt", "0")
+        server.set_tools([Tool("echo", "e", {"type": "object"}, lambda a: "ok")])
+        lines = [rpc(1, "initialize", init_params()), rpc(2, "tools/call", {"name": "echo"}), rpc(3, "ping")]
+        server.serve(io.StringIO("".join(json.dumps(m) + "\n" for m in lines)), Broken())
+        self.assertTrue(server._out_broken)
+        self.assertEqual(server._pending, 0)
+
+    def test_eof_does_not_wait_forever_for_slow_calls(self):
+        release = threading.Event()
+        server = McpServer("droidrt", "0", drain_seconds=0.3)
+        server.set_tools([Tool("slow", "s", {"type": "object"}, lambda a: release.wait(10) and "late")])
+        lines = [rpc(1, "initialize", init_params()), rpc(2, "tools/call", {"name": "slow"})]
+        started = time.monotonic()
+        server.serve(io.StringIO("".join(json.dumps(m) + "\n" for m in lines)), io.StringIO())
+        self.assertLess(time.monotonic() - started, 5)
+        release.set()
+        deadline = time.monotonic() + 5
+        while server._pending and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(server._pending, 0)
+
+    def test_sigterm_skips_the_drain(self):
+        release = threading.Event()
+        server = McpServer("droidrt", "0", drain_seconds=30)
+        server.set_tools([Tool("slow", "s", {"type": "object"}, lambda a: release.wait(10) and "late")])
+
+        class Term(io.StringIO):
+            n = 0
+
+            def readline(self, size=-1):
+                self.n += 1
+                if self.n == 1:
+                    return json.dumps(rpc(1, "initialize", init_params())) + "\n"
+                if self.n == 2:
+                    return json.dumps(rpc(2, "tools/call", {"name": "slow"})) + "\n"
+                raise SystemExit(0)  # what the SIGTERM handler does
+
+        started = time.monotonic()
+        with self.assertRaises(SystemExit):
+            server.serve(Term(), io.StringIO())
+        self.assertLess(time.monotonic() - started, 5)
+        release.set()
+
+    def test_queued_requests_dropped_at_shutdown_release_their_slot(self):
+        server = McpServer("droidrt", "0", workers=1, drain_seconds=0)
+        release = threading.Event()
+        server.set_tools([Tool("slow", "s", {"type": "object"}, lambda a: release.wait(10) and "x")])
+        lines = [rpc(1, "initialize", init_params())] + [rpc(i, "tools/call", {"name": "slow"}) for i in range(2, 6)]
+        server.serve(io.StringIO("".join(json.dumps(m) + "\n" for m in lines)), io.StringIO())
+        release.set()
+        deadline = time.monotonic() + 5
+        while (server._pending or server._inflight) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual((server._pending, server._inflight), (0, {}))
+
+    def test_concurrent_writes_are_whole_lines(self):
+        server = McpServer("droidrt", "0", workers=8)
+        server.set_tools([Tool("big", "b", {"type": "object"}, lambda a: "x" * 50_000)])
+
+        class Chunky(io.TextIOBase):
+            """Writes in small pieces with a thread switch in between."""
+
+            def __init__(self):
+                self.parts: list[str] = []
+
+            def write(self, s):
+                for i in range(0, len(s), 4096):
+                    self.parts.append(s[i:i + 4096])
+                    time.sleep(0)
+                return len(s)
+
+        out = Chunky()
+        lines = [rpc(1, "initialize", init_params())] + [rpc(i, "tools/call", {"name": "big"}) for i in range(2, 34)]
+        server.serve(io.StringIO("".join(json.dumps(m) + "\n" for m in lines)), out)
+        msgs = [json.loads(l) for l in "".join(out.parts).splitlines()]
+        self.assertEqual(sorted(m["id"] for m in msgs), list(range(1, 34)))
+
+
+class SemanticReloaderTest(unittest.TestCase):
+    def test_reloads_are_serialized_and_the_newest_view_wins(self):
+        from droidrt_mcp.server import SemanticReloader
+
+        flows_on_disk = ["old"]
+        loaded: list[list[str]] = []
+        first_started = threading.Event()
+        calls = {"n": 0}
+
+        def known():
+            return list(flows_on_disk)
+
+        def load(pkgs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                first_started.set()
+                time.sleep(0.3)  # the startup reload is slow
+            loaded.append(pkgs)
+
+        published = []
+        reload = SemanticReloader(known, lambda: [], load, lambda: published.append(list(loaded[-1])))
+        t = threading.Thread(target=reload)
+        t.start()
+        self.assertTrue(first_started.wait(5))
+        flows_on_disk.append("new")  # record_flow wrote a flow meanwhile
+        reload("extra")
+        t.join(5)
+        self.assertEqual(published[-1], ["extra", "new", "old"])
+
+    def test_installed_failure_is_tolerated(self):
+        from droidrt_mcp.server import SemanticReloader
+
+        got = []
+
+        def broken():
+            raise DeviceError("vm off")
+
+        SemanticReloader(lambda: ["a"], broken, got.append, lambda: None)()
+        self.assertEqual(got, [["a"]])
+
+
+class ReviewDeviceTest(ToolsTest):
+    def test_logical_displays_with_fields_in_between(self):
+        dumpsys = """  Logical Displays: size=2
+  Display 0:
+    mDisplayId=0
+    mIsEnabled=true
+    mIsInTransition=false
+    mLayerStack=0
+    mPrimaryDisplayDevice=Built-in Screen(local:4619827259835644672)
+    mBaseDisplayInfo=DisplayInfo{"Built-in Screen", uniqueId "local:4619827259835644672"}
+  Display 3:
+    mDisplayId=3
+    mIsEnabled=true
+    mLayerStack=3
+    mPrimaryDisplayDevice=scrcpy(virtual:com.android.shell,2000,scrcpy,0)
+  Display 4:
+    mDisplayId=4
+    mPrimaryDisplayDevice=null
+"""
+        self.assertEqual(parse_logical_displays(dumpsys), {0: "local:4619827259835644672",
+                                                           3: "virtual:com.android.shell,2000,scrcpy,0"})
+
+    def test_element_id_of_another_app_is_refused(self):
+        before = len(self.cmds("action"))
+        for call in (lambda: self.tools.tap({"package": "com.example", "element_id": "w7:0.1"}),
+                     lambda: self.tools.type_text({"package": "com.example", "element_id": "w7:0.0", "text": "x"})):
+            with self.assertRaises(ToolInputError) as ctx:
+                call()
+            self.assertIn("not on a window of com.example", str(ctx.exception))
+        self.assertEqual(len(self.cmds("action")), before)
+        # w5 is com.example's window in the fake agent: allowed, and w5:1 is not
+        # confused with w51.
+        self.tools.tap({"package": "com.example", "element_id": "w5:0.1"})
+        self.assertEqual(self.cmds("action")[-1], {"nodeId": "w5:0.1", "action": "click"})
+        self.assertIn({"package": "com.example", "maxDepth": 0}, self.cmds("tree"))
+        with self.assertRaises(ToolInputError):
+            self.device.check_node_owner("com.example", "w51:0")
+
+    def test_root_of_another_package_is_not_accepted(self):
+        with mock.patch.object(self.device, "tree", return_value=[{"id": "w5:0", "pkg": "com.other"}]):
+            with self.assertRaises(ToolInputError):
+                self.device.check_node_owner("com.example", "w5:0.1")
+
+    def test_stale_element_id_is_a_clear_tool_error(self):
+        with self.assertRaises(ToolInputError) as ctx:
+            self.tools.tap({"package": "com.example", "element_id": "w5:9"})
+        self.assertIn("stale", str(ctx.exception))
+        self.assertIn("get_screen", str(ctx.exception))
+
+    def test_press_without_display_never_uses_the_global_action(self):
+        self.device.sessions.clear()
+        with mock.patch.object(self.device, "displays", return_value=[]):
+            for key in ("back", "home", "enter"):
+                with self.assertRaises(ToolInputError):
+                    self.tools.press_key({"package": "com.example", "key": key})
+        self.assertEqual(self.cmds("global"), [])
+
+    def test_reply_needs_a_valid_action_index(self):
+        note = [{"key": "k", "package": "com.example", "actions": [{"title": "Reply", "remoteInput": True}]}]
+        with mock.patch.object(self.device.agent, "call", return_value=note):
+            with self.assertRaises(ToolInputError):
+                self.tools.reply_notification({"key": "k", "text": "x"})
+        with mock.patch.object(self.device.agent, "call", return_value={"not": "a list"}):
+            with self.assertRaises(ToolInputError):
+                self.tools.reply_notification({"key": "k", "text": "x"})
+
+    def test_sessions_survive_concurrent_list_and_close(self):
+        # The background semantic reload calls list_apps while tool calls open
+        # and close sessions; the shared dict must never break either side.
+        errors = []
+        stop = threading.Event()
+        self.device.scrcpy_processes = lambda: [{"pid": 1, "package": "com.example", "headless": True}]
+
+        def churn():
+            i = 0
+            while not stop.is_set():
+                i += 1
+                with self.device.lock:
+                    self.device.sessions[f"com.p{i % 50}"] = {"pid": 1, "displayId": 2}
+                    self.device.sessions.pop(f"com.p{(i + 25) % 50}", None)
+
+        def reader():
+            try:
+                for _ in range(300):
+                    self.device._save_sessions()
+                    self.device._session_alive("com.p3")
+            except Exception as e:  # pragma: no cover - the failure being tested
+                errors.append(e)
+
+        t = threading.Thread(target=churn)
+        t.start()
+        readers = [threading.Thread(target=reader) for _ in range(3)]
+        for r in readers:
+            r.start()
+        for r in readers:
+            r.join(30)
+        stop.set()
+        t.join(5)
+        self.assertEqual(errors, [])
+
+
+class HeadlessLifecycleTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.fake = FakeAgent()
+        self.device = make_device(self.fake, Path(self.tmp.name))
+        self.terminated = []
+        self.device._terminate = lambda pid, proc=None, wait=5: self.terminated.append(pid) or True
+
+    def tearDown(self):
+        self.device.agent.close()
+        self.fake.shutdown()
+        self.fake.server_close()
+        self.tmp.cleanup()
+
+    def fake_proc(self, pid):
+        proc = mock.Mock()
+        proc.pid = pid
+        proc.poll.return_value = None
+        return proc
+
+    def test_failure_while_waiting_for_the_display_stops_scrcpy(self):
+        proc = self.fake_proc(4242)
+        with mock.patch("droidrt_mcp.device.subprocess.Popen", return_value=proc), \
+                mock.patch.object(Path, "read_text", side_effect=OSError("disk gone")):
+            with self.assertRaises(OSError):
+                self.device._start_headless("com.example")
+        self.assertEqual(self.terminated, [4242])
+        self.assertEqual(self.device._spawned, set())
+        self.assertNotIn("com.example", self.device.sessions)
+
+    def test_shutdown_stops_a_session_that_is_still_starting(self):
+        proc = self.fake_proc(5151)
+        started = threading.Event()
+        result = {}
+
+        def read_text(*a, **k):
+            started.set()
+            return ""  # no "New display" line yet
+
+        def run():
+            try:
+                self.device._start_headless("com.example")
+            except BaseException as e:
+                result["error"] = e
+
+        with mock.patch("droidrt_mcp.device.subprocess.Popen", return_value=proc), \
+                mock.patch.object(Path, "read_text", side_effect=read_text), \
+                mock.patch("droidrt_mcp.device.time.sleep"):
+            t = threading.Thread(target=run)
+            t.start()
+            self.assertTrue(started.wait(5))
+            self.device.shutdown(lock_timeout=1)
+            t.join(5)
+        self.assertIn(5151, self.terminated)
+        self.assertIsInstance(result.get("error"), DeviceError)
+        self.assertEqual(self.device.sessions, {})
+        # Nothing new starts once the server is closing.
+        with mock.patch("droidrt_mcp.device.subprocess.Popen") as popen:
+            with self.assertRaises(DeviceError):
+                self.device._start_headless("com.example")
+            popen.assert_not_called()
+
+    def test_shutdown_does_not_hang_on_a_busy_lock(self):
+        self.device.sessions["com.example"] = {"pid": 77, "displayId": 2, "proc": self.fake_proc(77)}
+        held = threading.Event()
+        done = threading.Event()
+
+        def hold():
+            with self.device.lock, self.device.agent._lock:
+                held.set()
+                done.wait(10)
+
+        t = threading.Thread(target=hold)
+        t.start()
+        self.assertTrue(held.wait(5))
+        started = time.monotonic()
+        self.device.shutdown(lock_timeout=0.2)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertIn(77, self.terminated)
+        done.set()
+        t.join(5)
+
+
+class AgentResponseShapeTest(unittest.TestCase):
+    def test_non_object_response_is_a_device_error(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        fake = FakeAgent()
+        self.addCleanup(fake.server_close)
+        self.addCleanup(fake.shutdown)
+        client = AgentClient(FakeAdb(fake), connect_timeout=2, key_path=key_file(Path(tmp.name)))
+        client.fixed_address = fake.address
+        self.addCleanup(client.close)
+        client.call("ping")
+        original = fake.respond
+
+        def respond(cmd, args):
+            if cmd == "tree":
+                raise _RawLine(b"[1, 2]\n")
+            return original(cmd, args)
+
+        fake.respond = respond
+        with mock.patch.object(FakeAgentHandler, "handle", _raw_capable_handle(FakeAgentHandler.handle)):
+            client.close()
+            with self.assertRaises(DeviceError) as ctx:
+                client.call("tree", {"package": "com.example"})
+        self.assertIn("not an object", str(ctx.exception))
+
+
+class _RawLine(Exception):
+    def __init__(self, raw):
+        super().__init__("raw")
+        self.raw = raw
+
+
+def _raw_capable_handle(orig):
+    """FakeAgentHandler.handle, except a respond() raising _RawLine writes that
+    line verbatim instead of a normal response."""
+    def handle(self):
+        srv = self.server
+        real = srv.respond
+
+        def wrapped(cmd, args):
+            try:
+                return real(cmd, args)
+            except _RawLine as e:
+                self.wfile.write(e.raw)
+                self.wfile.flush()
+                raise ConnectionAbortedError
+        srv.respond = wrapped
+        try:
+            orig(self)
+        except ConnectionAbortedError:
+            pass
+        finally:
+            srv.respond = real
+    return handle
+
+
+class RecordFlowOverwriteTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_existing_flow_needs_overwrite(self):
+        tools = Tools(mock.Mock(), flows_base=self.base)
+        args = {"package": "com.whatsapp", "name": "say_hi", "description": "first", "steps": [{"press": "back"}]}
+        tools.record_flow(args)
+        path = self.base / "com.whatsapp" / "say_hi.json"
+        with self.assertRaises(ToolInputError) as ctx:
+            tools.record_flow({**args, "description": "second"})
+        self.assertIn("overwrite=true", str(ctx.exception))
+        self.assertEqual(json.loads(path.read_text())["description"], "first")
+        tools.record_flow({**args, "description": "second", "overwrite": True})
+        self.assertEqual(json.loads(path.read_text())["description"], "second")
+        with self.assertRaises(ToolInputError):
+            tools.record_flow({**args, "overwrite": "yes"})
+        self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["say_hi.json"])  # no temp files left
+        self.assertIn("overwrite", {t.name: t for t in tools.generic()}["record_flow"].input_schema["properties"])
+
+    def test_predictable_temp_name_is_not_followed(self):
+        folder = self.base / "com.whatsapp"
+        folder.mkdir()
+        victim = self.base / "victim"
+        victim.write_text("keep")
+        (folder / "say_hi.json.tmp").symlink_to(victim)
+        flows.save_flow("com.whatsapp", "say_hi", "d", [{"press": "back"}], base=self.base)
+        self.assertEqual(victim.read_text(), "keep")
+        self.assertFalse((folder / "say_hi.json").is_symlink())
+
+
+class ApkCacheIntegrityTest(unittest.TestCase):
+    def make(self, tmp, pulled: bytes):
+        from droidrt_mcp.apks import ApkCache
+
+        class PullAdb(FakeAdb):
+            def shell(self, *args, timeout=30, check=True):
+                if args[:2] == ("dumpsys", "package"):
+                    return "    versionCode=7\n"
+                if args[:2] == ("pm", "path"):
+                    return "package:/data/app/x/base.apk\n"
+                return "1\n"
+
+            def run(self, *args, timeout=30, check=True, binary=False, input_data=None):
+                self.calls.append(args)
+                if args[0] == "pull":
+                    Path(args[2]).write_bytes(pulled)
+                return ""
+
+        adb = PullAdb()
+        return adb, ApkCache(adb, Path(tmp))
+
+    def test_damaged_cached_copy_is_pulled_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adb, cache = self.make(tmp, zip_bytes())
+            target = Path(tmp) / "com.a" / "7" / "base.apk"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"PK\x03\x04 truncated")
+            self.assertEqual(cache.base_apks("com.a"), [target])
+            self.assertTrue(zipfile.is_zipfile(target))
+            self.assertEqual(len([c for c in adb.calls if c[0] == "pull"]), 1)
+
+    def test_invalid_pull_is_not_cached(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adb, cache = self.make(tmp, b"error: device offline")
+            self.assertIsNone(cache.base_apks("com.a"))
+            self.assertFalse((Path(tmp) / "com.a" / "7" / "base.apk").exists())
+
+    def test_concurrent_requests_pull_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adb, cache = self.make(tmp, zip_bytes())
+            results = []
+            threads = [threading.Thread(target=lambda: results.append(cache.base_apks("com.a"))) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+            self.assertEqual(len(results), 4)
+            self.assertTrue(all(r == [Path(tmp) / "com.a" / "7" / "base.apk"] for r in results))
+            self.assertEqual(len([c for c in adb.calls if c[0] == "pull"]), 1)
 
 
 # ---------------------------------------------------------------- end to end

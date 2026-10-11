@@ -1,4 +1,4 @@
-#!/opt/homebrew/bin/python3
+#!/usr/bin/env python3
 """Compatibility matrix runner for droidrt.
 
 For every app listed in apps.json this script installs the APK on the already
@@ -43,6 +43,14 @@ TERM_WAIT = 15  # seconds to wait for scrcpy to exit after each SIGTERM
 
 class MatrixError(Exception):
     pass
+
+
+class Terminated(Exception):
+    """Raised from the SIGTERM/SIGHUP handler so cleanup code still runs."""
+
+
+def _on_terminate(signum: int, _frame) -> None:
+    raise Terminated(f"received signal {signum}")
 
 
 def tool(name: str) -> str:
@@ -153,7 +161,7 @@ class CpuSampler(threading.Thread):
         self.avg: float | None = None
 
     def _find_pid(self) -> int | None:
-        out = run(["/usr/bin/pgrep", "-f", f"qemu-system-aarch64.*-avd {self.avd}( |$)"], timeout=10).stdout.split()
+        out = run(["/usr/bin/pgrep", "-f", f"qemu-system-aarch64.*-avd {re.escape(self.avd)}( |$)"], timeout=10).stdout.split()
         return int(out[0]) if out else None
 
     def _ps(self, column: str) -> str:
@@ -203,17 +211,24 @@ def stop_scrcpy(proc: subprocess.Popen, notes: list[str]) -> None:
 
     SIGINT is ignored by background jobs and SIGKILL leaves the device side
     server dangling (it has hung system_server before), so neither is used.
+    A SIGTERM/SIGHUP sent to this script while it waits is held back until
+    scrcpy is stopped, so an interrupted run does not orphan it.
     """
-    for attempt in (1, 2):
-        if proc.poll() is not None:
-            return
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=TERM_WAIT)
-            return
-        except subprocess.TimeoutExpired:
-            log(f"scrcpy pid {proc.pid} still running after SIGTERM #{attempt}")
-    notes.append(f"scrcpy pid {proc.pid} did not exit after two SIGTERM, left running for manual check")
+    held = {signal.SIGTERM, signal.SIGHUP}
+    signal.pthread_sigmask(signal.SIG_BLOCK, held)
+    try:
+        for attempt in (1, 2):
+            if proc.poll() is not None:
+                return
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=TERM_WAIT)
+                return
+            except subprocess.TimeoutExpired:
+                log(f"scrcpy pid {proc.pid} still running after SIGTERM #{attempt}")
+        notes.append(f"scrcpy pid {proc.pid} did not exit after two SIGTERM, left running for manual check")
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, held)
 
 
 # ---------------------------------------------------------------- media
@@ -237,6 +252,40 @@ def mean_luma(ffmpeg: str, image: Path) -> float | None:
 
 
 # ---------------------------------------------------------------- per app
+
+def open_with_scrcpy(dev: Device, app: App, args: argparse.Namespace, work: Path, record: Path,
+                     res: Result) -> tuple[int | None, str]:
+    """Keeps the app open on a new scrcpy display for args.seconds.
+
+    Returns (scrcpy exit code if it quit early, else None; pid of the app).
+    scrcpy is always stopped before returning, including on errors.
+    """
+    early_exit: int | None = None
+    pid = ""
+    for attempt in range(3):
+        started = time.monotonic()
+        with open(work / "scrcpy.log", "wb") as slog:
+            proc = subprocess.Popen(scrcpy_cmd(args.serial, args.display, app.package, record),
+                                    stdout=slog, stderr=slog, stdin=subprocess.DEVNULL,
+                                    start_new_session=True)  # keep terminal Ctrl-C away from scrcpy
+            try:
+                deadline = started + args.seconds
+                while time.monotonic() < deadline and proc.poll() is None:
+                    time.sleep(0.5)
+                early_exit = proc.poll()
+                # Check the process while the display still exists.
+                pid = dev.pidof(app.package)
+            finally:
+                stop_scrcpy(proc, res.notes)
+        # scrcpy sometimes loses the race with its device server and quits within
+        # seconds ("Server connection failed"); that is a harness failure, so retry.
+        flaky = b"Server connection failed" in (work / "scrcpy.log").read_bytes()
+        if early_exit is None or not flaky or time.monotonic() - started > 10:
+            break
+        log(f"{app.package}: scrcpy connection failed, retrying ({attempt + 1})")
+        time.sleep(2)
+    return early_exit, pid
+
 
 def test_app(dev: Device, app: App, args: argparse.Namespace, out_dir: Path) -> Result:
     res = Result(app)
@@ -268,29 +317,12 @@ def test_app(dev: Device, app: App, args: argparse.Namespace, out_dir: Path) -> 
     sampler.start()
 
     log(f"{app.package}: opening for {args.seconds}s")
-    for attempt in range(3):
-        with open(work / "scrcpy.log", "wb") as slog:
-            proc = subprocess.Popen(scrcpy_cmd(args.serial, args.display, app.package, record),
-                                    stdout=slog, stderr=slog, stdin=subprocess.DEVNULL,
-                                    start_new_session=True)  # keep terminal Ctrl-C away from scrcpy
-            try:
-                started = time.monotonic()
-                deadline = started + args.seconds
-                while time.monotonic() < deadline and proc.poll() is None:
-                    time.sleep(0.5)
-                early_exit = proc.poll()
-                # Check the process while the display still exists.
-                pid = dev.pidof(app.package)
-            finally:
-                stop_scrcpy(proc, res.notes)
-        # scrcpy sometimes loses the race with its device server and quits within
-        # seconds ("Server connection failed"); that is a harness failure, so retry.
-        flaky = b"Server connection failed" in (work / "scrcpy.log").read_bytes()
-        if early_exit is None or not flaky or time.monotonic() - started > 10:
-            break
-        log(f"{app.package}: scrcpy connection failed, retrying ({attempt + 1})")
-        time.sleep(2)
-    sampler.stop()
+    try:
+        early_exit, pid = open_with_scrcpy(dev, app, args, work, record, res)
+    finally:
+        # Always stop the sampler, even when adb times out mid run; otherwise
+        # its thread keeps polling ps for the rest of the matrix.
+        sampler.stop()
 
     if early_exit is not None:
         res.notes.append(f"scrcpy exited early with code {early_exit}")
@@ -392,6 +424,10 @@ def dry_run(apps: list[App], args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str]) -> int:
+    # The default SIGTERM action kills Python without running finally blocks,
+    # which would leave scrcpy (in its own session) recording forever.
+    signal.signal(signal.SIGTERM, _on_terminate)
+    signal.signal(signal.SIGHUP, _on_terminate)
     args = parse_args(argv)
     apps = load_apps(args.apps, args.apk_dir, args.only)
     if args.dry_run:
@@ -436,3 +472,6 @@ if __name__ == "__main__":
     except MatrixError as e:
         log(str(e))
         sys.exit(1)
+    except (KeyboardInterrupt, Terminated) as e:
+        log(f"interrupted ({e or 'Ctrl-C'}); partial report kept")
+        sys.exit(130)

@@ -16,42 +16,69 @@ import logging
 from pathlib import Path
 
 from . import flows, manifest
-from .schema import PACKAGE_RE, ToolError, app_slug, validate_tool
+from .schema import NAME_RE, ToolError, app_slug, package_ok, validate_tool
 
 __all__ = ["tools_for", "load_curated", "validate_tool", "ToolError"]
 
 log = logging.getLogger(__name__)
 
 CURATED_DIR = Path(__file__).resolve().parent / "curated"
+MAX_SLUG = 20
 
 
 def load_curated(package: str, base: Path | None = None) -> tuple[str | None, list[dict]]:
     """Return (slug, tools) from the curated file, or (None, []) when there is none."""
+    if not package_ok(package):
+        raise ValueError(f"bad package name {package!r}")
     path = (base or CURATED_DIR) / f"{package}.json"
     if not path.is_file():
         return None, []
     data = json.loads(path.read_text(encoding="utf-8"))
-    if data.get("package") != package:
+    if not isinstance(data, dict) or data.get("package") != package:
         raise ToolError(f"{path.name}: package field does not match {package!r}")
     tools = []
-    for tool in data.get("tools", []):
+    raw_tools = data.get("tools", [])
+    for tool in raw_tools if isinstance(raw_tools, list) else []:
         try:
             tools.append(validate_tool(tool, package))
         except ToolError as e:
             log.warning("skipping curated tool in %s: %s", path.name, e)
     slug = data.get("slug")
-    return (slug if isinstance(slug, str) and slug else None), tools
+    # The slug prefixes every generated and recorded tool name, so it must be a
+    # short valid name on its own.
+    ok = isinstance(slug, str) and len(slug) <= MAX_SLUG and NAME_RE.match(slug) and not slug.endswith("_")
+    return (slug if ok else None), tools
 
 
 def tools_for(package: str, apk_paths: list[Path] | None = None) -> list[dict]:
     """All semantic tools for `package`, curated first, then flows, then manifest."""
-    if not isinstance(package, str) or not PACKAGE_RE.match(package):
+    if not package_ok(package):
         raise ValueError(f"bad package name {package!r}")
-    slug, curated = load_curated(package)
-    info = manifest.analyze(package, [Path(p) for p in apk_paths]) if apk_paths else None
+    # Each source is best effort: a broken curated file, flow directory or APK
+    # must never take the other sources down with it.
+    slug, curated = None, []
+    try:
+        slug, curated = load_curated(package)
+    except Exception as e:  # noqa: BLE001
+        log.warning("curated tools for %s unavailable: %s", package, e)
+    info = None
+    if apk_paths:
+        try:
+            info = manifest.analyze(package, [Path(p) for p in apk_paths])
+        except Exception as e:  # noqa: BLE001
+            log.warning("manifest analysis for %s failed: %s", package, e)
     slug = slug or app_slug(package, info.label if info else None)
-    recorded, _ = flows.load_flows(package, slug)
-    generated = manifest.generate_tools(info, slug) if info else []
+    recorded: list[dict] = []
+    try:
+        recorded, _ = flows.load_flows(package, slug)
+    except Exception as e:  # noqa: BLE001
+        log.warning("recorded flows for %s unavailable: %s", package, e)
+    generated: list[dict] = []
+    if info:
+        try:
+            generated = manifest.generate_tools(info, slug)
+        except Exception as e:  # noqa: BLE001
+            log.warning("manifest tools for %s failed: %s", package, e)
 
     merged: list[dict] = []
     seen: set[str] = set()

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import Any, Callable
 
 from . import __version__
 from .agent import Adb, AgentClient
@@ -49,6 +50,35 @@ def import_semantic():
         log.info("semantic package not found; only generic tools are available")
         return None
     return semantic
+
+
+class SemanticReloader:
+    """Reloads the semantic tools and publishes the new tool set.
+
+    One reload runs at a time: the startup reload in the background thread and
+    the one after record_flow would otherwise race, and the slower one, holding
+    an older view of the flows folder, could publish last and drop the flow that
+    was just recorded."""
+
+    def __init__(self, known: Callable[[], list[str]], installed: Callable[[], list[str]],
+                 load: Callable[[list[str]], Any], publish: Callable[[], None]):
+        self.known = known
+        self.installed = installed
+        self.load = load
+        self.publish = publish
+        self.lock = threading.Lock()
+
+    def __call__(self, extra: str | None = None) -> None:
+        with self.lock:
+            pkgs = set(self.known())
+            try:
+                pkgs |= set(self.installed())
+            except Exception as e:
+                log.info("cannot list installed apps for semantic tools: %s", e)
+            if extra:
+                pkgs.add(extra)
+            self.load(sorted(pkgs))
+            self.publish()
 
 
 def build(serial: str | None = None) -> tuple[McpServer, DeviceManager, Tools]:
@@ -109,17 +139,10 @@ def build(serial: str | None = None) -> tuple[McpServer, DeviceManager, Tools]:
             pkgs |= {p.stem for p in curated.glob("*.json")}
         return sorted(pkgs)
 
-    def reload_semantic(extra: str | None = None) -> None:
-        pkgs = known_packages()
-        if adb.is_ready():
-            try:
-                pkgs = sorted(set(pkgs) | {a["package"] for a in device.list_apps()})
-            except Exception as e:
-                log.info("cannot list installed apps for semantic tools: %s", e)
-        if extra and extra not in pkgs:
-            pkgs.append(extra)
-        tools.load_semantic(pkgs)
-        publish()
+    def installed() -> list[str]:
+        return [a["package"] for a in device.list_apps()] if adb.is_ready() else []
+
+    reload_semantic = SemanticReloader(known_packages, installed, tools.load_semantic, publish)
 
     tools.on_flows_changed = reload_semantic  # type: ignore[method-assign]
     publish()
@@ -165,6 +188,9 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, on_term)
+    # A closed terminal sends SIGHUP, whose default action skips the cleanup
+    # below and leaves the headless scrcpy sessions running.
+    signal.signal(signal.SIGHUP, on_term)
     stdin = open(sys.stdin.fileno(), "r", encoding="utf-8", errors="replace", newline="\n", closefd=False)
     stdout = open(sys.stdout.fileno(), "w", encoding="utf-8", newline="\n", closefd=False)
     # Anything printed by mistake must never corrupt the protocol stream.

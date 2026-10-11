@@ -12,7 +12,8 @@ This document defines how the three automation pieces talk to each other:
 - **Transport:**
   - The agent listens on the abstract local socket `droidrt_agent`.
   - The host reaches it with `adb -s <serial> forward tcp:<port> localabstract:droidrt_agent`.
-  - Messages are newline-delimited UTF-8 JSON, one message per line. A line may not exceed 1 MiB (1048576 bytes, newline excluded); a longer line closes the connection.
+  - Messages are newline-delimited UTF-8 JSON, one message per line. After authentication a line may not exceed 1 MiB (1048576 bytes, newline excluded); before it, the auth line may not exceed 4 KiB. A longer line closes the connection. A response larger than 32 MiB is replaced by an error asking for a narrower query.
+  - The agent accepts at most 8 connections that are still in the handshake and 32 connections in total; extra connections are closed immediately.
   - Only peers with uid 0 (root) or 2000 (shell, which is what `adb forward` connections come from) are accepted. Other peers are disconnected before any byte is exchanged.
   - Every connection starts with the handshake below. After it, several requests may be pipelined on a single connection, and responses keep the order of the requests.
 - **Key delivery:**
@@ -33,7 +34,7 @@ This document defines how the three automation pieces talk to each other:
      - Wrong HMAC: `{"ok": false, "error": "auth failed"}`, then close.
      - A first line that is not a JSON object with a 64 hex `auth` and a 32 hex `nonce` (for example `POST / HTTP/1.1`, or a regular request): close immediately, without a reply and without processing anything.
   - The agent compares `auth` in constant time (`MessageDigest.isEqual`).
-  - The handshake must finish within 10 seconds of the connection being accepted, or the agent closes it. There is no timeout after authentication.
+  - The whole handshake must finish within 10 seconds of the connection being accepted (a total deadline, not a per read timeout), or the agent closes it. There is no timeout after authentication.
 - **Request:** `{"id": <int>, "cmd": "<name>", "args": {...}}`
 - **Response:**
   - Success: `{"id": <int>, "ok": true, "result": ...}`
